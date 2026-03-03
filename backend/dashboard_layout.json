@@ -1,0 +1,63 @@
+{
+  "gauges": [
+    {
+      "id": "d6",
+      "label": "RIG AIR PRESSURE",
+      "dataKey": "rig_air_pressure",
+      "min": 0,
+      "max": "200",
+      "unit": "psi",
+      "color": "#22d3ee",
+      "gridWidth": 3,
+      "size": 160
+    },
+    {
+      "id": "d1",
+      "label": "HOOK LOAD",
+      "dataKey": "hook_load",
+      "min": 0,
+      "max": 100,
+      "unit": "ton",
+      "color": "#38bdf8",
+      "gridWidth": 6,
+      "size": 300,
+      "majorTicks": 10,
+      "minorTicks": 4
+    },
+    {
+      "id": "d3",
+      "label": "ENGINE RPM",
+      "dataKey": "engine_rpm",
+      "min": 0,
+      "max": 2000,
+      "unit": "RPM",
+      "color": "#34d399",
+      "gridWidth": 3,
+      "size": 160
+    }
+  ],
+  "sideStats": [
+    {
+      "key": "pump_pressure",
+      "label": "Pump Pressure",
+      "unit": "psi",
+      "min": 0,
+      "max": 5000
+    },
+    {
+      "key": "torque",
+      "label": "Rotary Torque",
+      "unit": "ft-lbs",
+      "min": 0,
+      "max": 20000
+    }
+  ],
+  "units": {
+    "wob": "tonnes",
+    "depth": "m"
+  },
+  "wellInfo": {
+    "well": "ABCD",
+    "rig": "ROM-II"
+  }
+}

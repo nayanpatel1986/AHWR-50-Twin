@@ -1,183 +1,183 @@
+'use strict';
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const http = require('http');
 const { Server } = require("socket.io");
 const { InfluxDB } = require('@influxdata/influxdb-client');
 const fs = require('fs');
+const fsp = require('fs/promises');
 const path = require('path');
-const { exec } = require('child_process');
+const auth = require('./lib/auth');
+const validate = require('./lib/validate');
+const ldap = require('./lib/ldap');
+const alarms = require('./lib/alarms');
+const workover = require('./lib/workover');
+const maintenance = require('./lib/maintenance');
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
-});
-
-const PORT = 5000;
+const PORT = Number(process.env.PORT || 5000);
+const DATA_DIR = process.env.DATA_DIR || __dirname;
 const INFLUX_URL = process.env.INFLUX_URL || 'http://influxdb:8086';
-const INFLUX_TOKEN = process.env.INFLUX_TOKEN || 'my-super-secret-auth-token';
+const INFLUX_TOKEN = process.env.INFLUX_TOKEN;
 const INFLUX_ORG = process.env.INFLUX_ORG || 'romii_org';
 const INFLUX_BUCKET = process.env.INFLUX_BUCKET || 'romii_bucket';
+const DATA_SOURCE = process.env.DATA_SOURCE || 'plc';
+const MAX_WELL_DEPTH = Number(process.env.MAX_WELL_DEPTH_M || 15000); // sanity clamp (m)
+const FRESH_MS = Number(process.env.DATA_FRESH_MS || 5000);          // data older than this = stale
 
-app.use(cors());
-app.use(express.json());
+if (!INFLUX_TOKEN) {
+    console.error('FATAL: INFLUX_TOKEN env var is required (no hardcoded fallback). Refusing to start.');
+    process.exit(1);
+}
 
-// Basic health check
-app.get('/', (req, res) => {
-    res.send('ROM-II Backend is running');
-});
+// Allowed browser origins. Same-origin (served behind nginx) needs no entry;
+// set CORS_ORIGIN (comma-separated) only for cross-origin dev access.
+const CORS_ORIGINS = (process.env.CORS_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
+const allowedOrigin = CORS_ORIGINS.length ? CORS_ORIGINS : false;
 
-// Start server
-server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+const app = express();
+app.set('trust proxy', 1); // behind nginx
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: allowedOrigin, methods: ['GET', 'POST'], credentials: true } });
 
-// Socket.io connection
+app.use(helmet());
+app.use(cors({ origin: allowedOrigin, methods: ['GET', 'POST'], credentials: true }));
+app.use(express.json({ limit: '1mb' }));
+
+// Unauthenticated health checks (used by the Docker healthcheck / probes).
+app.get('/', (req, res) => res.send('ROM-II Backend is running'));
+app.get('/healthz', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+
+// Require a valid JWT on the Socket.io handshake before any telemetry streams.
+io.use(auth.socketAuth);
 io.on('connection', (socket) => {
-    console.log('A user connected');
-    socket.on('disconnect', () => {
-        console.log('User disconnected');
-    });
+    socket.emit('rig_data', latestRigData);            // prime newly-connected clients
+    socket.emit('dashboard_layout_update', getDashboardConfig());
+    socket.emit('alarms', alarms.snapshot());          // prime the alarm banner/list
 });
 
 // InfluxDB Query Client
 const queryApi = new InfluxDB({ url: INFLUX_URL, token: INFLUX_TOKEN }).getQueryApi(INFLUX_ORG);
 
-// --- Drilling Physics Engine ---
-const DRILLING_STATE_FILE = './drilling_state.json';
-let drillingState = {
-    stringWeight: 0, // kips (Tare weight)
-    totalDepth: 304.8, // 1000 ft in meters
-    bitDepth: 0, // meters
-    lastBlockPosition: 0 // ft (Block position is still in ft in ACS tag)
+// --- Atomic JSON persistence (temp file + rename; off the hot loop) -------
+const writeJsonAtomic = async (file, obj) => {
+    const tmp = `${file}.${process.pid}.tmp`;
+    await fsp.writeFile(tmp, JSON.stringify(obj, null, 2));
+    await fsp.rename(tmp, file);
+};
+const readJsonSync = (file, fallback) => {
+    try { return JSON.parse(fs.readFileSync(file)); } catch { return fallback; }
 };
 
-// Load state from disk if exists
-if (fs.existsSync(DRILLING_STATE_FILE)) {
-    try {
-        const saved = JSON.parse(fs.readFileSync(DRILLING_STATE_FILE));
-        drillingState = { ...drillingState, ...saved };
-    } catch (e) {
-        console.error("Failed to load drilling state:", e);
-    }
+// --- Drilling Physics Engine ---
+const DRILLING_STATE_FILE = path.join(DATA_DIR, 'drilling_state.json');
+let drillingState = {
+    stringWeight: 0,     // tonnes-force (tare/string weight captured at zero-WOB)
+    totalDepth: 304.8,   // m (seed = 1000 ft)
+    bitDepth: 0,         // m
+    lastBlockPosition: 0 // ft (block position is in feet)
+};
+
+// Reject NaN/negative/absurd depths; bound to a configured maximum well depth.
+function clampDepth(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0) return 0;
+    return Math.min(n, MAX_WELL_DEPTH);
 }
 
-const saveDrillingState = () => {
-    fs.writeFileSync(DRILLING_STATE_FILE, JSON.stringify(drillingState, null, 2));
+// Load state from disk if present, then clamp any out-of-range persisted values.
+{
+    const saved = readJsonSync(DRILLING_STATE_FILE, null);
+    if (saved) drillingState = { ...drillingState, ...saved };
+    drillingState.bitDepth = clampDepth(drillingState.bitDepth);
+    drillingState.totalDepth = clampDepth(drillingState.totalDepth);
+}
+
+// Persistence is decoupled from the 1 Hz poll loop: mark dirty, flush async.
+let drillingDirty = false;
+const markDrillingDirty = () => { drillingDirty = true; };
+const flushDrillingState = async () => {
+    if (!drillingDirty) return;
+    drillingDirty = false;
+    try { await writeJsonAtomic(DRILLING_STATE_FILE, drillingState); }
+    catch (e) { console.error('Failed to persist drilling state:', e.message); drillingDirty = true; }
 };
 
 // --- PLC / S7 Configuration API ---
-app.get('/api/config/plc', (req, res) => {
-    try {
-        const data = JSON.parse(fs.readFileSync(path.join(__dirname, 'plc_config.json'), 'utf8'));
-        res.json(data);
-    } catch (err) {
-        res.status(500).json({ error: 'Failed to read PLC configuration' });
-    }
+// GET: any authenticated user may view the current device config.
+app.get('/api/config/plc', auth.requireAuth, (req, res) => {
+    res.json(getModbusConfig());
 });
 
-app.post('/api/config/plc', async (req, res) => {
+// POST: admin-only. Validates the payload (stops TOML/config injection),
+// regenerates the managed section of telegraf.conf, and lets Telegraf
+// hot-reload it via `--watch-config`. No Docker socket / restart involved.
+app.post('/api/config/plc', auth.requireAuth, auth.requireRole('admin'), async (req, res) => {
     try {
-        const config = req.body; // Expect { slaves: [...] }
-        saveModbusConfig(config);
+        const config = validate.validatePlcConfig(req.body);
+        await saveModbusConfig(config);
 
-        // Update Telegraf.conf
-        let content = fs.readFileSync(CONFIG_PATH, 'utf8');
-
-        // Write to telegraf.conf
+        const content = fs.readFileSync(CONFIG_PATH, 'utf8');
         const startMarker = '# PLC_CONFIG_START';
         const endMarker = '# PLC_CONFIG_END';
         const startIndex = content.indexOf(startMarker);
         const endIndex = content.indexOf(endMarker);
-
         if (startIndex === -1 || endIndex === -1) {
-            throw new Error("Telegraf configuration file is missing markers.");
+            throw new Error('Telegraf configuration file is missing PLC_CONFIG markers.');
         }
-
         const newSection = generateTelegrafConfig(config);
         const before = content.substring(0, startIndex + startMarker.length);
         const after = content.substring(endIndex);
-        const newContent = `${before}\n${newSection}\n${after}`;
-        fs.writeFileSync(CONFIG_PATH, newContent);
+        fs.writeFileSync(CONFIG_PATH, `${before}\n${newSection}\n${after}`);
 
-        // Restart Telegraf Container via Docker Socket API
-        const options = {
-            socketPath: '/var/run/docker.sock',
-            path: '/containers/romii_telegraf/restart',
-            method: 'POST'
-        };
-
-        const dockerReq = http.request(options, (dockerRes) => {
-            if (dockerRes.statusCode === 204 || dockerRes.statusCode === 200) {
-                console.log("Telegraf container restarted successfully.");
-                res.json({ success: true, message: "Configuration saved and Telegraf restarted." });
-            } else {
-                res.status(500).json({ success: false, error: 'Failed to restart Telegraf. Docker status: ' + dockerRes.statusCode });
-            }
-        });
-
-        dockerReq.on('error', (err) => {
-            res.status(500).json({ success: false, error: 'Docker socket error: ' + err.message });
-        });
-        dockerReq.end();
-
+        res.json({ success: true, message: 'Configuration saved. Telegraf will hot-reload automatically.' });
     } catch (err) {
-        console.error("Error saving PLC config:", err);
-        res.status(500).json({ success: false, error: err.message });
+        const status = err.status || 500;
+        if (status >= 500) console.error('Error saving PLC config:', err);
+        res.status(status).json({ success: false, error: err.message });
     }
 });
 
-// Physics Loop (Runs on data update)
+// Physics loop (runs on each data update). All weights are in tonnes-force
+// (consistent with the PLC "Weight on Hook -Ton" tag); depths are in metres.
 const updatePhysics = (rigData) => {
-    // 1. Get Inputs
-    const currentHookLoad = rigData.drawworks?.hook_load || 0;
-    const currentBlockPos = rigData.drawworks?.block_position || 0;
+    const currentHookLoad = Number(rigData.drawworks?.hook_load) || 0;
+    const currentBlockPos = Number(rigData.drawworks?.block_position) || 0;
 
-    // PLC Source of Truth Check
-    // If the PLC is providing depth data directly, we prioritize it
+    // Prefer PLC-supplied depth as source of truth. 0 is a VALID reading
+    // (bit at surface), so test for finiteness, not truthiness.
     const plcBitDepth = rigData.drilling?.bit_depth;
     const plcHoleDepth = rigData.drilling?.hole_depth;
+    const hasPlcBit = Number.isFinite(plcBitDepth);
+    const hasPlcHole = Number.isFinite(plcHoleDepth);
 
-    if (plcBitDepth !== undefined && plcBitDepth > 0) {
-        drillingState.bitDepth = plcBitDepth;
-    }
-    if (plcHoleDepth !== undefined && plcHoleDepth > 0) {
-        drillingState.totalDepth = plcHoleDepth;
-    }
+    if (hasPlcBit) drillingState.bitDepth = clampDepth(plcBitDepth);
+    if (hasPlcHole) drillingState.totalDepth = clampDepth(plcHoleDepth);
 
-    // 2. Calculate WOB
-    // WOB is the weight of the string supported by the bottom, so StringWeight - HookLoad
-    let wob = Math.max(0, drillingState.stringWeight - currentHookLoad);
+    // WOB = string/tare weight currently NOT carried by the hook (tonnes-force).
+    const wob = Math.max(0, drillingState.stringWeight - currentHookLoad);
 
-    // 3. Calculate Depths (Backup/Local Calculation)
-    const deltaBlock = drillingState.lastBlockPosition - currentBlockPos; // Positive = Moving Down
+    // Local dead-reckoning fallback ONLY when the PLC isn't supplying bit depth.
+    if (!hasPlcBit) {
+        const deltaBlock = drillingState.lastBlockPosition - currentBlockPos; // +ve = moving down (ft)
+        const deltaBlockMeters = deltaBlock * 0.3048;
+        const newBitDepth = clampDepth(drillingState.bitDepth + deltaBlockMeters);
 
-    // Update Bit Depth based on block movement ONLY if PLC data isn't active
-    // This maintains historical consistency if PLC sends 0 or is missing
-    if (!plcBitDepth) {
-        // Delta block is in feet, bitDepth is in meters
-        let deltaBlockMeters = deltaBlock * 0.3048;
-        let newBitDepth = drillingState.bitDepth + deltaBlockMeters;
-        newBitDepth = Math.max(0, newBitDepth);
-
-        // Drilling Logic
-        const WOB_THRESHOLD = 1.0; // kips
+        const WOB_THRESHOLD = 1.0; // tonnes-force; on-bottom (drilling) threshold
         if (wob > WOB_THRESHOLD) {
             drillingState.bitDepth = newBitDepth;
             if (drillingState.bitDepth > drillingState.totalDepth) {
-                drillingState.totalDepth = drillingState.bitDepth;
+                drillingState.totalDepth = clampDepth(drillingState.bitDepth);
             }
         } else {
             drillingState.bitDepth = Math.min(newBitDepth, drillingState.totalDepth);
         }
     }
 
-    // Update History
     drillingState.lastBlockPosition = currentBlockPos;
-    saveDrillingState();
+    markDrillingDirty();
 
     return {
         wob: Number(wob.toFixed(1)),
@@ -186,50 +186,44 @@ const updatePhysics = (rigData) => {
     };
 };
 
-// --- APIs for Calibration ---
-app.post('/api/drilling/zero-wob', (req, res) => {
-    // Set String Weight to current Hook Load
-    // We need the latest hook load, which we might not have direct access to here easily 
-    // without querying DB or caching. For now, let's accept it from the client or use valid cached data.
-    // Better: Client sends current hookload to confirm? Or we just use strict state.
-    // Let's rely on the body for now to be explicit, or fetch latest.
-    const { currentHookLoad } = req.body;
-    if (currentHookLoad !== undefined) {
-        drillingState.stringWeight = Number(currentHookLoad);
-        saveDrillingState();
-        res.json({ success: true, stringWeight: drillingState.stringWeight });
-    } else {
-        res.status(400).json({ error: "Missing currentHookLoad" });
+// --- APIs for Calibration (operator or admin) ---
+app.post('/api/drilling/zero-wob', auth.requireAuth, auth.requireRole('admin', 'operator'), (req, res) => {
+    try {
+        const stringWeight = validate.num(req.body.currentHookLoad, 'currentHookLoad', { min: 0, max: 5000 });
+        drillingState.stringWeight = stringWeight;
+        markDrillingDirty();
+        maintenance.logCalibration({ type: 'Weight Indicator (Zero-WOB)', asset: 'drawworks', value: `${stringWeight} t tare`, by: req.user.username });
+        res.json({ success: true, stringWeight });
+    } catch (e) {
+        res.status(e.status || 400).json({ error: e.message });
     }
 });
 
-app.post('/api/drilling/set-depth', (req, res) => {
-    const { bitDepth, holeDepth } = req.body;
-    if (bitDepth !== undefined) drillingState.bitDepth = Number(bitDepth);
-    if (holeDepth !== undefined) drillingState.totalDepth = Number(holeDepth);
-    saveDrillingState();
-    res.json({ success: true, state: drillingState });
+app.post('/api/drilling/set-depth', auth.requireAuth, auth.requireRole('admin', 'operator'), (req, res) => {
+    try {
+        const { bitDepth, holeDepth } = req.body;
+        if (bitDepth !== undefined) drillingState.bitDepth = clampDepth(validate.num(bitDepth, 'bitDepth', { min: 0, max: MAX_WELL_DEPTH }));
+        if (holeDepth !== undefined) drillingState.totalDepth = clampDepth(validate.num(holeDepth, 'holeDepth', { min: 0, max: MAX_WELL_DEPTH }));
+        markDrillingDirty();
+        maintenance.logCalibration({ type: 'Depth / Block Encoder (Set-Depth)', asset: 'drawworks', value: `bit ${drillingState.bitDepth?.toFixed?.(1) ?? '—'} m`, by: req.user.username });
+        res.json({ success: true, state: drillingState });
+    } catch (e) {
+        res.status(e.status || 400).json({ error: e.message });
+    }
 });
 
-app.get('/api/drilling/state', (req, res) => {
+app.get('/api/drilling/state', auth.requireAuth, (req, res) => {
     res.json(drillingState);
 });
 
 // --- Main Socket & Data Loop ---
 
-// Modbus Configuration API helpers
-const CONFIG_PATH = process.env.TELEGRAF_CONFIG_PATH || './telegraf/telegraf.conf';
-const DB_PATH = path.join(__dirname, 'plc_config.json');
+// Telegraf config + device-config persistence paths.
+const CONFIG_PATH = process.env.TELEGRAF_CONFIG_PATH || path.join(DATA_DIR, 'telegraf', 'telegraf.conf');
+const DB_PATH = path.join(DATA_DIR, 'plc_config.json');
 
-// Helper: Read/Write JSON DB
-const getModbusConfig = () => {
-    if (!fs.existsSync(DB_PATH)) return { slaves: [] };
-    return JSON.parse(fs.readFileSync(DB_PATH));
-};
-
-const saveModbusConfig = (config) => {
-    fs.writeFileSync(DB_PATH, JSON.stringify(config, null, 2));
-};
+const getModbusConfig = () => readJsonSync(DB_PATH, { slaves: [] });
+const saveModbusConfig = (config) => writeJsonAtomic(DB_PATH, config);
 
 // Map Modbus fields to application categories
 // Map S7 field names to application categories
@@ -255,6 +249,11 @@ const FIELD_MAP = {
     "TOTAL BIT Depth-m": { meas: "drilling", field: "hole_depth" }, // meters
     "SPP-Bar": { meas: "mudpump", field: "pressure" },
     "Delta SPP-Bar": { meas: "mudpump", field: "delta_pressure" },
+
+    // Wellhead / well-service pressures (workover)
+    "Tubing Pressure-Bar": { meas: "wellhead", field: "tubing_pressure" },
+    "Casing Pressure-Bar": { meas: "wellhead", field: "casing_pressure" },
+    "Wellhead Pressure-Bar": { meas: "wellhead", field: "wellhead_pressure" },
     "ROP-m/h": { meas: "drilling", field: "rop" },
     "Ropes Wear-ton/km": { meas: "drawworks", field: "rope_wear" },
     "Delta Torque-daN*m": { meas: "drilling", field: "delta_torque" },
@@ -397,11 +396,14 @@ const FIELD_MAP = {
     "PCT Sequence-0=OFF, 1=MAKE-UP, 2=BREAK-OUT, 3=RESET, 4=FAULT": { meas: "pct", field: "sequence" },
 };
 
-const queryData = async () => {
-    // Query for latest values. S7comm uses 'AHWR' as measurement name.
-    const measurements = ['drawworks', 'engine', 'mudpump', 'wellcontrol', 'modbus', 'AHWR', 'fluid', 'drilling', 'hpu', 'system', 'htd', 'acs', 'cat_engine', 'cwk', 'pct'];
-    const measurementFilter = measurements.map(m => `r["_measurement"] == "${m}"`).join(' or ');
+// Measurements polled for the live view (S7comm writes under "AHWR";
+// app-level measurements support mock/Modbus sources). Shared with /api/history.
+const LIVE_MEASUREMENTS = ['drawworks', 'engine', 'mudpump', 'wellcontrol', 'wellhead', 'modbus', 'AHWR', 'fluid', 'drilling', 'hpu', 'htd', 'acs', 'cat_engine', 'cwk', 'pct'];
 
+let lastDataAt = 0; // epoch ms of the last tick that returned sensor data
+
+const queryData = async () => {
+    const measurementFilter = LIVE_MEASUREMENTS.map(m => `r["_measurement"] == "${m}"`).join(' or ');
     const fluxQuery = `
     from(bucket: "${INFLUX_BUCKET}")
       |> range(start: -10s)
@@ -417,71 +419,90 @@ const queryData = async () => {
                     const o = tableMeta.toObject(row);
                     let meas = o._measurement;
                     let f = o._field;
-
-                    if (FIELD_MAP[f]) {
-                        meas = FIELD_MAP[f].meas;
-                        f = FIELD_MAP[f].field;
-                    }
-
+                    if (FIELD_MAP[f]) { meas = FIELD_MAP[f].meas; f = FIELD_MAP[f].field; }
                     if (!data[meas]) data[meas] = {};
                     data[meas][f] = o._value;
                 },
-                error(error) {
-                    console.error('InfluxDB Query Error:', error);
-                    reject(error);
-                },
-                complete() {
-                    resolve();
-                },
+                error(error) { reject(error); },
+                complete() { resolve(); },
             });
         });
 
-        // Check if we have valid sensor data (Drawworks is critical)
-        const hasSensorData = data.drawworks || data.engine || data.mudpump;
+        const hasSensorData = !!(data.drawworks || data.engine || data.mudpump || data.drilling || data.AHWR);
+        const now = Date.now();
+        if (hasSensorData) lastDataAt = now;
+        const stale = (now - lastDataAt) > FRESH_MS;
 
         if (hasSensorData) {
-            // Run Physics Engine
             const physicsData = updatePhysics(data);
-            data.drilling = { ...(data.drilling || {}), ...physicsData };
+            const plcWob = data.drilling ? data.drilling.wob : undefined;
+            // Depth always comes from the clamped physics state (which itself
+            // prefers PLC depth). WOB prefers the real PLC measurement when present.
+            data.drilling = {
+                ...(data.drilling || {}),            // keep PLC rop, rpm, torque, operation_mode, ...
+                bit_depth: physicsData.bit_depth,
+                hole_depth: physicsData.hole_depth,
+                wob: Number.isFinite(plcWob) ? plcWob : physicsData.wob
+            };
         } else {
-            // No Sensor Data (PLC Disconnected) -> Aggressive Zero State
+            // No live feed: do NOT fabricate zeros. Show last-known depth and
+            // let _meta.stale tell the UI the values are not live.
             data.drilling = {
                 ...(data.drilling || {}),
-                wob: 0,
-                bit_depth: 0,
-                hole_depth: 0
+                bit_depth: Number(drillingState.bitDepth.toFixed(2)),
+                hole_depth: Number(drillingState.totalDepth.toFixed(2))
             };
         }
 
-        // Map real Modbus "wellcontrol" data to frontend expectation "well_control", defaulting to safely zeroed fields if missing
-        const wcReal = data.wellcontrol || {};
-        data.well_control = {
-            annular_pressure: wcReal.annular_pressure || 0,
-            manifold_pressure: wcReal.manifold_pressure || 0,
-            accumulator_pressure: wcReal.accumulator_pressure || 0,
-            annular_open: wcReal.annular_open || false,
-            annular_close: wcReal.annular_close || false,
-            pipe_ram_open: wcReal.pipe_ram_open || false,
-            pipe_ram_close: wcReal.pipe_ram_close || false,
-            blind_ram_open: wcReal.blind_ram_open || false,
-            blind_ram_close: wcReal.blind_ram_close || false,
-            shear_ram_open: wcReal.shear_ram_open || false
-        };
-        // Remove the internal un-underscored reference to save payload size
+        // Well control / BOP: present ONLY when a real source exists. Never
+        // coalesce safety-critical ram/pressure signals to a benign false/0 state.
+        const wc = data.wellcontrol;
+        if (wc && Object.keys(wc).length > 0) {
+            data.well_control = {
+                available: true,
+                annular_pressure: wc.annular_pressure ?? null,
+                manifold_pressure: wc.manifold_pressure ?? null,
+                accumulator_pressure: wc.accumulator_pressure ?? null,
+                annular_open: wc.annular_open ?? null,
+                annular_close: wc.annular_close ?? null,
+                pipe_ram_open: wc.pipe_ram_open ?? null,
+                pipe_ram_close: wc.pipe_ram_close ?? null,
+                blind_ram_open: wc.blind_ram_open ?? null,
+                blind_ram_close: wc.blind_ram_close ?? null,
+                shear_ram_open: wc.shear_ram_open ?? null
+            };
+        } else {
+            data.well_control = { available: false };
+        }
         delete data.wellcontrol;
 
-        // Emit data (Real or Zeroed)
-        // console.log("Drawworks payload:", JSON.stringify(data.drawworks));
-        console.log("Raw Modbus Object:", JSON.stringify(data.modbus));
-        console.log("Well Control payload:", JSON.stringify(data.well_control));
+        data._meta = {
+            ts: new Date(now).toISOString(),
+            source: hasSensorData ? DATA_SOURCE : 'none',
+            stale,
+            age_ms: lastDataAt ? (now - lastDataAt) : null,
+            connected: hasSensorData
+        };
 
+        // --- Workover layer: activity/NPT, torque-turn, alarms ---
+        if (hasSensorData) {
+            data._activity = workover.updateActivity(data, now);
+            const tt = workover.updateTorqueTurn(data, now);
+            if (tt.connectionMade) io.emit('connection_made', tt.connectionMade);
+            data._torqueturn = workover.getTorqueTurnLive();
+            const al = alarms.evaluate(data, now);
+            data._alarms = al.counts;
+            if (al.changed) io.emit('alarms', al);
+            maintenance.updateHours(data, now);
+        } else {
+            data._activity = workover.getCurrent();
+            data._alarms = alarms.snapshot().counts;
+        }
 
-        // Cache the latest data for initial page loads
         latestRigData = data;
         io.emit('rig_data', data);
-
     } catch (err) {
-        console.error("Error querying InfluxDB:", err);
+        console.error('Error querying InfluxDB:', err.message);
     }
 };
 
@@ -489,17 +510,36 @@ const queryData = async () => {
 let latestRigData = {};
 
 // API: Get Latest Rig Data
-app.get('/api/rig/latest', (req, res) => {
+app.get('/api/rig/latest', auth.requireAuth, (req, res) => {
     res.json(latestRigData);
 });
 
-// Poll InfluxDB every second
-setInterval(queryData, 1000);
+// Self-scheduling poll loop with an in-flight guard so a slow Influx query
+// can never let invocations overlap and stack up on shared mutable state.
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 1000);
+let pollTimer = null;
+let pollStopped = false;
+const scheduleNextPoll = () => {
+    if (pollStopped) return;
+    pollTimer = setTimeout(async () => {
+        try { await queryData(); } finally { scheduleNextPoll(); }
+    }, POLL_INTERVAL_MS);
+};
 
 // API: Get Historical Data
 // API: Get Historical Data
-app.get('/api/history', async (req, res) => {
+app.get('/api/history', auth.requireAuth, async (req, res) => {
     const { range, start, stop } = req.query;
+
+    // Validate time inputs before they are interpolated into the Flux query
+    // (prevents Flux injection). Allow relative durations and RFC3339 instants only.
+    if (start !== undefined || stop !== undefined) {
+        if (!validate.isFluxInstant(start) || !validate.isFluxInstant(stop)) {
+            return res.status(400).json({ error: 'Invalid start/stop (use RFC3339 timestamps)' });
+        }
+    } else if (range !== undefined && !validate.isFluxRange(range)) {
+        return res.status(400).json({ error: 'Invalid range (use a relative duration like -1h, -7d)' });
+    }
 
     // Build range filter
     let rangeFilter = '';
@@ -535,8 +575,9 @@ app.get('/api/history', async (req, res) => {
     // Determine if we need date in the time label
     const needsDate = range?.includes('24h') || range?.includes('7d') || range?.includes('30d') || range?.includes('mo') || (start && stop);
 
-    const measurements = ['drawworks', 'engine', 'mudpump', 'wellcontrol', 'modbus'];
-    const measurementFilter = measurements.map(m => `r["_measurement"] == "${m}"`).join(' or ');
+    // Same measurement set as the live view (crucially includes "AHWR", under
+    // which all S7comm/PLC fields are written) so equipment history isn't empty.
+    const measurementFilter = LIVE_MEASUREMENTS.map(m => `r["_measurement"] == "${m}"`).join(' or ');
 
     const fluxQuery = `
     import "types"
@@ -544,8 +585,8 @@ app.get('/api/history', async (req, res) => {
       ${rangeFilter}
       |> filter(fn: (r) => ${measurementFilter})
       |> filter(fn: (r) => types.isType(v: r._value, type: "float") or types.isType(v: r._value, type: "int") or types.isType(v: r._value, type: "uint"))
-      |> aggregateWindow(every: ${windowPeriod}, fn: mean, createEmpty: false)
-      |> yield(name: "mean")
+      |> aggregateWindow(every: ${windowPeriod}, fn: last, createEmpty: false)
+      |> yield(name: "last")
   `;
 
     try {
@@ -687,93 +728,130 @@ const generateTelegrafConfig = (config) => {
 // Redundant endpoints removed (consolidated to /api/config/plc)
 
 // --- User Management ---
-const USERS_FILE = './users.json';
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
 let users = [];
 
-// Load users
-const loadUsers = () => {
-    if (fs.existsSync(USERS_FILE)) {
-        try {
-            users = JSON.parse(fs.readFileSync(USERS_FILE));
-        } catch (e) {
-            console.error("Failed to load users:", e);
-            users = [];
-        }
-    } else {
-        // Default Admin
-        users = [{ id: 1, username: 'admin', password: 'admin', role: 'admin', status: 'active' }];
-        saveUsers();
-    }
-};
+const saveUsers = () => writeJsonAtomic(USERS_FILE, users);
 
-const saveUsers = () => {
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+// Load users; migrate any legacy plaintext passwords to bcrypt hashes; seed the
+// initial admin from env (ADMIN_USERNAME / ADMIN_PASSWORD) when no store exists.
+const loadUsers = () => {
+    const saved = readJsonSync(USERS_FILE, null);
+    if (Array.isArray(saved) && saved.length) {
+        let migrated = false;
+        users = saved.map(u => {
+            if (u.password && !auth.isHashed(u.password)) {
+                migrated = true;
+                return { ...u, password: auth.hashPassword(u.password) };
+            }
+            return u;
+        });
+        if (migrated) { saveUsers(); console.log('Migrated legacy plaintext passwords to bcrypt hashes.'); }
+        return;
+    }
+    const adminUser = process.env.ADMIN_USERNAME || 'admin';
+    const adminPass = process.env.ADMIN_PASSWORD;
+    if (!adminPass) {
+        console.error('FATAL: no users.json present and ADMIN_PASSWORD env is not set; cannot seed initial admin.');
+        process.exit(1);
+    }
+    users = [{ id: 1, username: adminUser, password: auth.hashPassword(adminPass), role: 'admin', status: 'active' }];
+    saveUsers();
+    console.log(`Seeded initial admin user "${adminUser}" from environment.`);
 };
 
 loadUsers();
 
-// API: List Users
-app.get('/api/users', (req, res) => {
-    // Return users without passwords
-    const safeUsers = users.map(({ password, ...u }) => u);
-    res.json(safeUsers);
-});
+const sanitizeUser = ({ password, ...u }) => u;
+const activeAdminCount = () => users.filter(u => u.role === 'admin' && u.status !== 'inactive').length;
 
-// API: Add User
-app.post('/api/users', (req, res) => {
-    const { username, password, role } = req.body;
-    if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-
-    if (users.find(u => u.username === username)) {
-        return res.status(400).json({ error: "Username already exists" });
+// Just-in-time provisioning for a directory (LDAP/AD) user. Mirrors the AD
+// account into the local store so roles/status/audit work. An admin can lock a
+// role locally (roleLocked) or deactivate the account to block sign-in.
+const upsertLdapUser = async (dir) => {
+    let u = users.find(x => x.username.toLowerCase() === dir.username.toLowerCase());
+    if (u) {
+        if (u.status === 'inactive') return null; // locally disabled -> blocked
+        if (!u.roleLocked) u.role = dir.role;      // refresh role from directory groups
+        u.displayName = dir.displayName;
+        u.source = 'ldap';
+    } else {
+        u = { id: Date.now(), username: dir.username, displayName: dir.displayName, role: dir.role, status: 'active', source: 'ldap' };
+        users.push(u);
     }
+    await saveUsers();
+    return u;
+};
 
-    const newUser = {
-        id: Date.now(),
-        username,
-        password, // In prod, hash this!
-        role: role || 'operator',
-        status: 'active'
-    };
-    users.push(newUser);
-    saveUsers();
-    res.json({ success: true, user: { ...newUser, password: undefined } });
+// API: List Users (admin)
+app.get('/api/users', auth.requireAuth, auth.requireRole('admin'), (req, res) => {
+    res.json(users.map(sanitizeUser));
 });
 
-// API: Update User
-app.put('/api/users/:id', (req, res) => {
+// API: Add User (admin)
+app.post('/api/users', auth.requireAuth, auth.requireRole('admin'), async (req, res) => {
+    const { username, password, role } = req.body;
+    if (!validate.USERNAME_RE.test(String(username || ''))) {
+        return res.status(400).json({ error: 'Username must be 3-40 chars [A-Za-z0-9_.-]' });
+    }
+    if (!password || String(password).length < 8) {
+        return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+    const newRole = role || 'operator';
+    if (!validate.ROLES.includes(newRole)) return res.status(400).json({ error: 'Invalid role' });
+    if (users.find(u => u.username === username)) {
+        return res.status(400).json({ error: 'Username already exists' });
+    }
+    const newUser = { id: Date.now(), username, password: auth.hashPassword(password), role: newRole, status: 'active' };
+    users.push(newUser);
+    await saveUsers();
+    res.json({ success: true, user: sanitizeUser(newUser) });
+});
+
+// API: Update User (admin)
+app.put('/api/users/:id', auth.requireAuth, auth.requireRole('admin'), async (req, res) => {
     const { id } = req.params;
     const { username, password, role, status } = req.body;
-
     const index = users.findIndex(u => u.id == id);
-    if (index === -1) return res.status(404).json({ error: "User not found" });
+    if (index === -1) return res.status(404).json({ error: 'User not found' });
 
-    // Update fields
-    if (username) users[index].username = username;
-    if (password) users[index].password = password; // In prod, hash!
-    if (role) users[index].role = role;
-    if (status) users[index].status = status;
-
-    saveUsers();
-    res.json({ success: true, user: { ...users[index], password: undefined } });
+    if (username !== undefined) {
+        if (!validate.USERNAME_RE.test(String(username))) return res.status(400).json({ error: 'Invalid username' });
+        users[index].username = username;
+    }
+    if (password !== undefined && password !== '') {
+        if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+        users[index].password = auth.hashPassword(password);
+    }
+    // Guard: never let the last active admin be demoted or deactivated.
+    const wouldDropAdmin = (role && role !== 'admin') || (status === 'inactive');
+    if (users[index].role === 'admin' && wouldDropAdmin && activeAdminCount() <= 1) {
+        return res.status(400).json({ error: 'Cannot demote or deactivate the last active admin' });
+    }
+    if (role !== undefined) {
+        if (!validate.ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role' });
+        users[index].role = role;
+    }
+    if (status !== undefined) users[index].status = status;
+    await saveUsers();
+    res.json({ success: true, user: sanitizeUser(users[index]) });
 });
 
-// API: Delete User
-app.delete('/api/users/:id', (req, res) => {
+// API: Delete User (admin)
+app.delete('/api/users/:id', auth.requireAuth, auth.requireRole('admin'), async (req, res) => {
     const { id } = req.params;
-    const initialLength = users.length;
-    users = users.filter(u => u.id != id);
-
-    if (users.length < initialLength) {
-        saveUsers();
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ error: "User not found" });
+    const target = users.find(u => u.id == id);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (target.role === 'admin' && activeAdminCount() <= 1) {
+        return res.status(400).json({ error: 'Cannot delete the last active admin' });
     }
+    users = users.filter(u => u.id != id);
+    await saveUsers();
+    res.json({ success: true });
 });
 
 // --- Dashboard Persistence ---
-const DASHBOARD_FULL_CONFIG_FILE = './dashboard_layout.json';
+const DASHBOARD_FULL_CONFIG_FILE = path.join(DATA_DIR, 'dashboard_layout.json');
 
 // Default Layout (Fallback)
 const DEFAULT_DASHBOARD_CONFIG = {
@@ -838,14 +916,8 @@ const DEFAULT_DASHBOARD_CONFIG = {
 };
 
 const getDashboardConfig = () => {
-    let config = DEFAULT_DASHBOARD_CONFIG;
-    if (fs.existsSync(DASHBOARD_FULL_CONFIG_FILE)) {
-        try {
-            config = JSON.parse(fs.readFileSync(DASHBOARD_FULL_CONFIG_FILE));
-        } catch (e) {
-            console.error("Failed to load dashboard config:", e);
-        }
-    }
+    // Clone the default so we never mutate the shared constant by reference.
+    let config = readJsonSync(DASHBOARD_FULL_CONFIG_FILE, null) || JSON.parse(JSON.stringify(DEFAULT_DASHBOARD_CONFIG));
 
     // Migration: Enforce allowed gauges (WOH, WOB, HTD RPM, HTD TORQUE, PCT TORQUE) and max 5
     if (config.gauges) {
@@ -866,12 +938,10 @@ const getDashboardConfig = () => {
     return config;
 };
 
-const saveDashboardConfig = (config) => {
-    fs.writeFileSync(DASHBOARD_FULL_CONFIG_FILE, JSON.stringify(config, null, 2));
-};
+const saveDashboardConfig = (config) => writeJsonAtomic(DASHBOARD_FULL_CONFIG_FILE, config);
 
-// API: Get Dashboard Layout
-app.get('/api/dashboard/layout', (req, res) => {
+// API: Get Dashboard Layout (any authenticated user)
+app.get('/api/dashboard/layout', auth.requireAuth, (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
@@ -879,8 +949,8 @@ app.get('/api/dashboard/layout', (req, res) => {
     res.json(getDashboardConfig());
 });
 
-// API: Save Dashboard Layout
-app.post('/api/dashboard/layout', (req, res) => {
+// API: Save Dashboard Layout (admin)
+app.post('/api/dashboard/layout', auth.requireAuth, auth.requireRole('admin'), async (req, res) => {
     const incomingConfig = req.body;
     const existingConfig = getDashboardConfig();
 
@@ -896,27 +966,156 @@ app.post('/api/dashboard/layout', (req, res) => {
         ...incomingConfig
     };
 
-    saveDashboardConfig(mergedConfig);
+    await saveDashboardConfig(mergedConfig);
     // Real-time broadcast
     io.emit('dashboard_layout_update', mergedConfig);
     res.json({ success: true, config: mergedConfig });
 });
 
-// --- Authentication API ---
-app.post('/api/login', (req, res) => {
-    const { username, password } = req.body;
-
-    const user = users.find(u => u.username === username && u.password === password && u.status !== 'inactive');
-
-    if (user) {
-        // Return mock token and user info (excluding password)
-        const { password, ...safeUser } = user;
-        res.json({
-            success: true,
-            token: `mock-jwt-token-romii-${user.role}`,
-            user: safeUser
-        });
-    } else {
-        res.status(401).json({ success: false, message: 'Invalid credentials or account inactive' });
-    }
+// --- Workover: Activity / NPT ---
+app.get('/api/activity/current', auth.requireAuth, (req, res) => res.json(workover.getCurrent() || {}));
+app.get('/api/activity/codes', auth.requireAuth, (req, res) => res.json(workover.getCodes()));
+app.get('/api/activity/log', auth.requireAuth, (req, res) => res.json(workover.getLog(req.query.date)));
+app.post('/api/activity/set', auth.requireAuth, auth.requireRole('admin', 'operator'), (req, res) => {
+    try {
+        const { code, npt } = req.body || {};
+        res.json({ success: true, current: workover.setActivity(code, npt) });
+    } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
 });
+
+// --- Workover: Alarm management ---
+app.get('/api/alarms', auth.requireAuth, (req, res) => res.json(alarms.getActive()));
+app.get('/api/alarms/history', auth.requireAuth, (req, res) => res.json(alarms.getHistory(Number(req.query.limit) || 200)));
+app.post('/api/alarms/ack-all', auth.requireAuth, auth.requireRole('admin', 'operator'), (req, res) => {
+    const acknowledged = alarms.ackAll(req.user.username);
+    const snap = alarms.snapshot(); io.emit('alarms', snap);
+    res.json({ success: true, acknowledged, ...snap });
+});
+app.post('/api/alarms/:id/ack', auth.requireAuth, auth.requireRole('admin', 'operator'), (req, res) => {
+    const ok = alarms.ack(req.params.id, req.user.username);
+    const snap = alarms.snapshot(); io.emit('alarms', snap);
+    res.json({ success: ok, ...snap });
+});
+app.get('/api/alarms/config', auth.requireAuth, (req, res) => res.json(alarms.getConfig()));
+app.put('/api/alarms/config', auth.requireAuth, auth.requireRole('admin'), async (req, res) => {
+    try { res.json({ success: true, config: await alarms.setConfig(req.body) }); }
+    catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
+
+// --- Workover: Torque-turn / connections ---
+app.get('/api/connections', auth.requireAuth, (req, res) => res.json(workover.getConnections(req.query.date)));
+app.get('/api/torqueturn/current', auth.requireAuth, (req, res) => res.json(workover.getTorqueTurnLive()));
+
+// --- Workover: Daily report ---
+app.get('/api/report/daily', auth.requireAuth, (req, res) => res.json(workover.getDailyReport(req.query.date)));
+app.get('/api/report/header', auth.requireAuth, (req, res) => res.json(workover.getHeader()));
+app.put('/api/report/header', auth.requireAuth, auth.requireRole('admin', 'operator'), async (req, res) => {
+    res.json({ success: true, header: await workover.setHeader(req.body || {}) });
+});
+
+// --- Maintenance & asset health ---
+app.get('/api/maintenance/summary', auth.requireAuth, (req, res) => res.json(maintenance.getSummary(latestRigData)));
+app.get('/api/maintenance/pm', auth.requireAuth, (req, res) => res.json(maintenance.getPM(latestRigData)));
+app.post('/api/maintenance/pm/:id/service', auth.requireAuth, auth.requireRole('admin', 'operator'), (req, res) => {
+    try { res.json({ success: true, task: maintenance.serviceTask(req.params.id, { ...req.body, by: req.user.username }) }); }
+    catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
+app.get('/api/maintenance/calibrations', auth.requireAuth, (req, res) => res.json(maintenance.getCalibrations(Number(req.query.limit) || 200)));
+app.post('/api/maintenance/calibrations', auth.requireAuth, auth.requireRole('admin', 'operator'), (req, res) => {
+    res.json({ success: true, record: maintenance.logCalibration({ ...req.body, by: req.user.username }) });
+});
+app.get('/api/maintenance/downtime', auth.requireAuth, (req, res) => res.json(maintenance.getDowntime(Number(req.query.limit) || 200)));
+app.get('/api/maintenance/reason-codes', auth.requireAuth, (req, res) => res.json(maintenance.REASON_CODES));
+app.post('/api/maintenance/downtime', auth.requireAuth, auth.requireRole('admin', 'operator'), (req, res) => {
+    try { res.json({ success: true, record: maintenance.logDowntime({ ...req.body, by: req.user.username }) }); }
+    catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
+app.post('/api/maintenance/downtime/:id/close', auth.requireAuth, auth.requireRole('admin', 'operator'), (req, res) => {
+    try { res.json({ success: true, record: maintenance.closeDowntime(req.params.id, { by: req.user.username }) }); }
+    catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
+
+// --- Authentication API ---
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: Number(process.env.LOGIN_RATE_LIMIT || 20),
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many login attempts. Please try again later.' }
+});
+
+// Tells the login UI which providers are available (unauthenticated).
+app.get('/api/auth/info', (req, res) => res.json(ldap.info()));
+
+// Login supports local accounts and/or Windows-domain (LDAP/AD) accounts,
+// selected by AUTH_MODE (local | ldap | both). In 'both', a local account is
+// tried first (break-glass admin), then the directory.
+app.post('/api/login', loginLimiter, async (req, res) => {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+        return res.status(400).json({ success: false, message: 'Username and password required' });
+    }
+    const mode = (process.env.AUTH_MODE || 'local').toLowerCase();
+
+    // 1) Local authentication.
+    if (mode === 'local' || mode === 'both') {
+        const local = users.find(u => u.username === username && u.status !== 'inactive');
+        if (local && local.password && auth.verifyPassword(password, local.password)) {
+            return res.json({ success: true, token: auth.signToken(local), user: sanitizeUser(local) });
+        }
+        if (mode === 'local') {
+            return res.status(401).json({ success: false, message: 'Invalid credentials or account inactive' });
+        }
+    }
+
+    // 2) Windows domain (LDAP/Active Directory) authentication.
+    if ((mode === 'ldap' || mode === 'both') && ldap.ldapEnabled()) {
+        try {
+            const dir = await ldap.authenticate(username, password);
+            const u = await upsertLdapUser(dir);
+            if (!u) return res.status(403).json({ success: false, message: 'Account disabled' });
+            return res.json({ success: true, token: auth.signToken(u), user: sanitizeUser(u) });
+        } catch (e) {
+            return res.status(401).json({ success: false, message: 'Invalid domain credentials' });
+        }
+    }
+
+    return res.status(401).json({ success: false, message: 'Invalid credentials or account inactive' });
+});
+
+// --- Error handling, startup & graceful shutdown ---------------------------
+// Catch-all error middleware so a thrown error in any handler returns JSON
+// instead of crashing or leaking a stack trace.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+    const status = err.status || 500;
+    if (status >= 500) console.error('Unhandled error:', err.message);
+    res.status(status).json({ error: status >= 500 ? 'Internal server error' : err.message });
+});
+
+server.listen(PORT, () => {
+    console.log(`ROM-II backend listening on port ${PORT} (data source: ${DATA_SOURCE})`);
+    scheduleNextPoll();
+});
+
+// Periodically flush drilling state off the hot loop.
+const flushTimer = setInterval(flushDrillingState, Number(process.env.STATE_FLUSH_MS || 5000));
+
+process.on('unhandledRejection', (reason) => console.error('Unhandled promise rejection:', reason));
+process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
+
+let shuttingDown = false;
+const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Received ${signal}, shutting down gracefully...`);
+    pollStopped = true;
+    if (pollTimer) clearTimeout(pollTimer);
+    clearInterval(flushTimer);
+    try { await flushDrillingState(); } catch (e) { /* best effort */ }
+    io.close();
+    server.close(() => { console.log('HTTP server closed.'); process.exit(0); });
+    setTimeout(() => process.exit(0), 5000).unref(); // hard cap
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

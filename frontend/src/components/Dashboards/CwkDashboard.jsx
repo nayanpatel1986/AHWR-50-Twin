@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Grid, Paper, Typography, Box, Divider } from '@mui/material';
-import io from 'socket.io-client';
+import { socket } from '../../socket';
 import AnalogGauge from '../Common/AnalogGauge';
-
-const socket = io('/');
+import GaugeCard from '../Common/GaugeCard';
 
 const StatusIndicator = ({ label, value, mapping }) => {
     const active = mapping[value] || { text: 'Unknown', color: '#64748b' };
@@ -37,10 +36,11 @@ export default function CwkDashboard() {
     const [data, setData] = useState({});
 
     useEffect(() => {
-        socket.on('rig_data', (newData) => {
+        const handler = (newData) => {
             if (newData.cwk) setData(newData.cwk);
-        });
-        return () => socket.off('rig_data');
+        };
+        socket.on('rig_data', handler);
+        return () => socket.off('rig_data', handler);
     }, []);
 
     const statusMapping = {
@@ -119,7 +119,7 @@ export default function CwkDashboard() {
 
             <Grid container spacing={3}>
                 <Grid item xs={12}>
-                    <Paper sx={{ p: 2, bgcolor: '#1e293b', display: 'flex', alignItems: 'center', gap: 2 }}>
+                    <Paper sx={{ p: 2, bgcolor: '#1e293b', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 2 }}>
                         <StatusIndicator label="Global Status" value={data.status} mapping={statusMapping} />
                         <Divider orientation="vertical" flexItem sx={{ bgcolor: '#334155' }} />
                         <StatusIndicator label="Source Cmd" value={data.source_cmd} mapping={sourceMapping} />
@@ -131,15 +131,16 @@ export default function CwkDashboard() {
                 </Grid>
 
                 <Grid item xs={12} md={4}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', justifyContent: 'center' }}>
+                    <GaugeCard>
                         <AnalogGauge
                             value={data.clamp_pressure || 0}
                             max={250}
                             label="CLAMP PRESSURE"
                             unit="bar"
+                            size="fill"
                             color="#38bdf8"
                         />
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} md={4}>

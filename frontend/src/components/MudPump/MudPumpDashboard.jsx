@@ -2,9 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { Grid, Paper, Typography, Box } from '@mui/material';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import { Activity, Gauge, Droplets, Waves } from 'lucide-react';
-import io from 'socket.io-client';
-
-const socket = io('/');
+import { socket } from '../../socket';
+import axios from '../../api';
 
 function MetricCard({ title, value, unit, icon: Icon, color = '#38bdf8' }) {
     return (
@@ -44,25 +43,25 @@ export default function MudPumpDashboard() {
 
     useEffect(() => {
         // Fetch latest data on mount
-        fetch('/api/rig/latest')
-            .then(res => res.json())
-            .then(data => {
+        axios.get('/api/rig/latest')
+            .then(({ data }) => {
                 if (data.mudpump) processMudPumpData(data.mudpump);
                 if (data.fluid) setFluidData(prev => ({ ...prev, ...data.fluid }));
             })
             .catch(err => console.error("Failed to fetch latest mudpump data:", err));
 
-        socket.on('rig_data', (data) => {
+        const handler = (data) => {
             if (data.mudpump) {
                 processMudPumpData(data.mudpump);
             }
             if (data.fluid) {
                 setFluidData(prev => ({ ...prev, ...data.fluid }));
             }
-        });
+        };
+        socket.on('rig_data', handler);
 
         return () => {
-            socket.off('rig_data');
+            socket.off('rig_data', handler);
         };
     }, []);
 

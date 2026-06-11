@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Grid, Paper, Typography, Box, Divider } from '@mui/material';
-import io from 'socket.io-client';
+import { socket } from '../../socket';
 import AnalogGauge from '../Common/AnalogGauge';
-
-const socket = io('/');
+import GaugeCard from '../Common/GaugeCard';
 
 const StatusIndicator = ({ label, value, mapping }) => {
     const active = mapping[value] || { text: 'Unknown', color: '#64748b' };
@@ -27,10 +26,11 @@ export default function PctDashboard() {
     const [data, setData] = useState({});
 
     useEffect(() => {
-        socket.on('rig_data', (newData) => {
+        const handler = (newData) => {
             if (newData.pct) setData(newData.pct);
-        });
-        return () => socket.off('rig_data');
+        };
+        socket.on('rig_data', handler);
+        return () => socket.off('rig_data', handler);
     }, []);
 
     const statusMapping = {
@@ -139,7 +139,7 @@ export default function PctDashboard() {
 
             <Grid container spacing={3}>
                 <Grid item xs={12}>
-                    <Paper sx={{ p: 2, bgcolor: '#1e293b', display: 'flex', alignItems: 'center', gap: 2 }}>
+                    <Paper sx={{ p: 2, bgcolor: '#1e293b', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 2 }}>
                         <StatusIndicator label="Operation Mode" value={data.op_mode} mapping={opModeMapping} />
                         <Divider orientation="vertical" flexItem sx={{ bgcolor: '#334155' }} />
                         <StatusIndicator label="System Status" value={data.status} mapping={statusMapping} />
@@ -149,39 +149,42 @@ export default function PctDashboard() {
                 </Grid>
 
                 <Grid item xs={12} md={4}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <GaugeCard>
                         <AnalogGauge
                             value={data.makeup_torque || 0}
                             max={5000}
                             label="MAKEUP TORQUE"
                             unit="daN*m"
+                            size="fill"
                             color="#38bdf8"
                         />
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} md={4}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <GaugeCard>
                         <AnalogGauge
                             value={data.spinner_makeup_torque || 0}
                             max={2000}
                             label="SPINNER MU TORQUE"
                             unit="daN*m"
+                            size="fill"
                             color="#4ade80"
                         />
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} md={4}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <GaugeCard>
                         <AnalogGauge
                             value={data.last_makeup_torque || 0}
                             max={5000}
                             label="LAST MU TORQUE"
                             unit="daN*m"
+                            size="fill"
                             color="#fbbf24"
                         />
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} md={4}>

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useLayoutEffect, useRef, useState } from 'react';
 import { Box, Typography } from '@mui/material';
 
 const AnalogGauge = ({
@@ -13,16 +13,69 @@ const AnalogGauge = ({
     majorTicks = 5,
     minorTicks = 4,
     color = '#38bdf8', // Default Cyan
-    criticalLevel = 0.8, // 80%
+    criticalLevel = 0.8, // 80% -> red danger band
+    warnLevel = 0.65,    // 65% -> amber warn band
     subValue,
-    subLabel
+    subLabel,
+    minSize = 160,
+    maxSize = 320
 }) => {
+    const isResponsive = size === 'fill' || size === 'auto' || size === 'responsive';
+    const containerRef = useRef(null);
+    const [measuredSize, setMeasuredSize] = useState(typeof size === 'number' ? size : 200);
+
+    const hasSubValue = subValue !== undefined && subValue !== null;
+
+    useLayoutEffect(() => {
+        if (!isResponsive || !containerRef.current || typeof ResizeObserver === 'undefined') return undefined;
+
+        const node = containerRef.current;
+        let frame = 0;
+        const clamp = (next) => Math.max(minSize, Math.min(maxSize, next));
+
+        const measure = () => {
+            const rect = node.getBoundingClientRect();
+            const subValueReserve = hasSubValue ? 34 : 0;
+            const usableHeight = rect.height > minSize ? rect.height - subValueReserve : rect.width;
+            const next = Math.round(clamp(Math.min(rect.width || maxSize, usableHeight || maxSize)));
+            setMeasuredSize((current) => (Math.abs(current - next) > 1 ? next : current));
+        };
+
+        const observer = new ResizeObserver(() => {
+            cancelAnimationFrame(frame);
+            frame = requestAnimationFrame(measure);
+        });
+
+        observer.observe(node);
+        measure();
+
+        return () => {
+            cancelAnimationFrame(frame);
+            observer.disconnect();
+        };
+    }, [hasSubValue, isResponsive, maxSize, minSize]);
+
+    const gaugeSize = isResponsive ? measuredSize : Number(size) || 200;
+
     // Calculations
-    const radius = size / 2;
-    const center = size / 2;
+    const numericValue = Number(value);
+    const numericMin = Number(min);
+    const numericMax = Number(max);
+    const hasNumericValue = Number.isFinite(numericValue);
+    const safeMin = Number.isFinite(numericMin) ? numericMin : 0;
+    const safeMax = Number.isFinite(numericMax) && numericMax !== safeMin ? numericMax : safeMin + 1;
+    const safeValue = hasNumericValue ? numericValue : safeMin;
+    const radius = gaugeSize / 2;
+    const center = gaugeSize / 2;
     const range = endAngle - startAngle;
-    const valueRatio = Math.min(Math.max((value - min) / (max - min), 0), 1);
+    const valueRatio = Math.min(Math.max((safeValue - safeMin) / (safeMax - safeMin), 0), 1);
     const angle = startAngle + (valueRatio * range);
+
+    // Alarm thresholds (as ratios of the dial). Needle/value turn red past critical.
+    const isCritical = hasNumericValue && criticalLevel != null && valueRatio >= criticalLevel;
+    const dangerColor = '#ef4444';
+    const warnColor = '#fbbf24';
+    const needleColor = isCritical ? dangerColor : color;
 
     // Polar to Cartesian
     const polarToCartesian = (centerX, centerY, radius, angleInDegrees) => {
@@ -33,13 +86,28 @@ const AnalogGauge = ({
         };
     };
 
+    // Build a band arc (SVG path) covering [fromRatio, toRatio] of the dial.
+    const arcRadius = radius - 6;
+    const describeArc = (fromRatio, toRatio) => {
+        const a0 = startAngle + (Math.min(Math.max(fromRatio, 0), 1) * range);
+        const a1 = startAngle + (Math.min(Math.max(toRatio, 0), 1) * range);
+        const start = polarToCartesian(center, center, arcRadius, a0);
+        const end = polarToCartesian(center, center, arcRadius, a1);
+        const largeArcFlag = (a1 - a0) > 180 ? 1 : 0;
+        // Sweep clockwise (increasing angle).
+        return `M ${start.x} ${start.y} A ${arcRadius} ${arcRadius} 0 ${largeArcFlag} 1 ${end.x} ${end.y}`;
+    };
+
+    const hasWarn = warnLevel != null && criticalLevel != null && warnLevel < criticalLevel;
+    const formattedValue = hasNumericValue ? numericValue.toFixed(0) : value;
+
     // Generate Ticks
     const ticks = [];
-    const tickStep = (max - min) / majorTicks;
+    const tickStep = (safeMax - safeMin) / majorTicks;
 
     for (let i = 0; i <= majorTicks; i++) {
-        const tickValue = min + (i * tickStep);
-        const tickRatio = (tickValue - min) / (max - min);
+        const tickValue = safeMin + (i * tickStep);
+        const tickRatio = (tickValue - safeMin) / (safeMax - safeMin);
         const tickAngle = startAngle + (tickRatio * range);
 
         // Major Tick
@@ -54,18 +122,21 @@ const AnalogGauge = ({
             />
         );
 
-        // Text Label for Tick
-        const textPos = polarToCartesian(center, center, radius - (size * 0.18), tickAngle);
-        ticks.push(
-            <text
-                key={`text-${i}`}
-                x={textPos.x} y={textPos.y}
-                textAnchor="middle" alignmentBaseline="middle"
-                fill="#94a3b8" fontSize={size * 0.06} fontWeight="bold"
-            >
-                {Math.round(tickValue)}
-            </text>
-        );
+        // Text labels are thinned on dense dials so they do not collide with live values.
+        const showTickLabel = majorTicks <= 6 || i === 0 || i === majorTicks || i % 2 === 0;
+        if (showTickLabel) {
+            const textPos = polarToCartesian(center, center, radius - (gaugeSize * 0.18), tickAngle);
+            ticks.push(
+                <text
+                    key={`text-${i}`}
+                    x={textPos.x} y={textPos.y}
+                    textAnchor="middle" alignmentBaseline="middle"
+                    fill="#94a3b8" fontSize={gaugeSize * 0.055} fontWeight="bold"
+                >
+                    {Math.round(tickValue)}
+                </text>
+            );
+        }
 
         // Minor Ticks between this major and the next
         if (i < majorTicks && minorTicks > 0) {
@@ -94,50 +165,78 @@ const AnalogGauge = ({
     const needleBaseR = polarToCartesian(center, center, 5, angle + 90);
 
     return (
-        <Box sx={{ position: 'relative', width: size, height: size, display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-            <svg width={size} height={size} style={{ overflow: 'visible' }}>
-                {/* Gauge Background Ring */}
-                <circle cx={center} cy={center} r={radius - 5} fill="none" stroke="#1e293b" strokeWidth="4" />
+        <Box
+            ref={containerRef}
+            sx={{
+                width: isResponsive ? '100%' : gaugeSize,
+                height: isResponsive ? '100%' : 'auto',
+                minWidth: 0,
+                minHeight: isResponsive ? minSize + (hasSubValue ? 34 : 0) : 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center'
+            }}
+        >
+            <Box sx={{ position: 'relative', width: gaugeSize, height: gaugeSize, flex: '0 0 auto', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                <svg width={gaugeSize} height={gaugeSize} style={{ overflow: 'visible' }}>
+                    {/* Gauge Background Ring */}
+                    <circle cx={center} cy={center} r={radius - 5} fill="none" stroke="#1e293b" strokeWidth="4" />
 
-                {/* Ticks */}
-                {ticks}
+                    {/* Alarm Bands: amber warn + red danger arcs */}
+                    {hasWarn && warnLevel < 1 && (
+                        <path
+                            d={describeArc(warnLevel, Math.min(criticalLevel, 1))}
+                            fill="none" stroke={warnColor} strokeWidth="4" strokeLinecap="butt" opacity="0.85"
+                        />
+                    )}
+                    {criticalLevel != null && criticalLevel < 1 && (
+                        <path
+                            d={describeArc(criticalLevel, 1)}
+                            fill="none" stroke={dangerColor} strokeWidth="4" strokeLinecap="butt" opacity="0.9"
+                        />
+                    )}
 
-                {/* Needle */}
-                <path
-                    d={`M ${needleBaseL.x} ${needleBaseL.y} L ${needleTip.x} ${needleTip.y} L ${needleBaseR.x} ${needleBaseR.y} Z`}
-                    fill={color}
-                    stroke="black"
-                    strokeWidth="1"
-                    filter="drop-shadow(0px 2px 2px rgba(0,0,0,0.5))"
-                />
-                <circle cx={center} cy={center} r="6" fill="#334155" stroke="white" strokeWidth="1" />
-            </svg>
+                    {/* Ticks */}
+                    {ticks}
 
-            {/* Value & Unit - Centered Lower */}
-            <Box sx={{ position: 'absolute', top: '60%', left: '50%', transform: 'translate(-50%, -50%)', textAlign: 'center' }}>
-                <Typography variant="h4" sx={{ color: 'white', fontWeight: 'bold', lineHeight: 1, textShadow: '0 2px 4px rgba(0,0,0,0.5)', fontSize: `${size * 0.18}px` }}>
-                    {typeof value === 'number' ? value.toFixed(0) : value}
+                    {/* Needle */}
+                    <path
+                        d={`M ${needleBaseL.x} ${needleBaseL.y} L ${needleTip.x} ${needleTip.y} L ${needleBaseR.x} ${needleBaseR.y} Z`}
+                        fill={needleColor}
+                        stroke="black"
+                        strokeWidth="1"
+                        filter="drop-shadow(0px 2px 2px rgba(0,0,0,0.5))"
+                    />
+                    <circle cx={center} cy={center} r="6" fill="#334155" stroke="white" strokeWidth="1" />
+                </svg>
+
+                {/* Value & Unit - centered inside the dial. Secondary values render below. */}
+                <Box sx={{ position: 'absolute', top: '61%', left: '50%', transform: 'translate(-50%, -50%)', textAlign: 'center', maxWidth: gaugeSize * 0.48 }}>
+                    <Typography variant="h4" noWrap sx={{ color: isCritical ? dangerColor : 'white', fontWeight: 'bold', lineHeight: 1, textShadow: '0 2px 4px rgba(0,0,0,0.5)', fontSize: `${gaugeSize * 0.16}px` }}>
+                        {formattedValue}
+                    </Typography>
+                    <Typography variant="caption" noWrap sx={{ color: '#94a3b8', fontSize: `${gaugeSize * 0.065}px`, display: 'block' }}>
+                        {unit}
+                    </Typography>
+                </Box>
+
+                {/* Label - Top Center */}
+                <Typography variant="body2" noWrap sx={{ position: 'absolute', top: '29%', maxWidth: gaugeSize * 0.58, color: '#94a3b8', fontWeight: 'bold', fontSize: `${gaugeSize * 0.047}px`, textTransform: 'uppercase', letterSpacing: 0.7, textAlign: 'center' }}>
+                    {label}
                 </Typography>
-                <Typography variant="caption" sx={{ color: '#94a3b8', fontSize: `${size * 0.07}px`, display: 'block' }}>
-                    {unit}
-                </Typography>
-
-                {(subValue !== undefined && subValue !== null) && (
-                    <Box sx={{ mt: 0.5, borderTop: '1px solid #334155', pt: 0.3 }}>
-                        <Typography variant="body2" sx={{ color: '#bef264', fontWeight: 'bold', fontSize: `${size * 0.12}px`, lineHeight: 1 }}>
-                            {subValue}
-                        </Typography>
-                        <Typography variant="caption" sx={{ color: '#94a3b8', fontSize: `${size * 0.04}px`, whiteSpace: 'nowrap' }}>
-                            {subLabel || ''}
-                        </Typography>
-                    </Box>
-                )}
             </Box>
 
-            {/* Label - Top Center */}
-            <Typography variant="body2" sx={{ position: 'absolute', top: '28%', color: '#94a3b8', fontWeight: 'bold', fontSize: `${size * 0.05}px`, textTransform: 'uppercase', letterSpacing: 1 }}>
-                {label}
-            </Typography>
+            {hasSubValue && (
+                <Box sx={{ mt: -1.5, minWidth: gaugeSize * 0.52, px: 1, py: 0.45, borderTop: '1px solid #334155', textAlign: 'center' }}>
+                    <Typography variant="body2" noWrap sx={{ color: '#bef264', fontWeight: 'bold', fontSize: `${gaugeSize * 0.105}px`, lineHeight: 1 }}>
+                        {subValue}
+                    </Typography>
+                    <Typography variant="caption" noWrap sx={{ color: '#94a3b8', fontSize: `${gaugeSize * 0.04}px`, display: 'block' }}>
+                        {subLabel || ''}
+                    </Typography>
+                </Box>
+            )}
         </Box>
     );
 };

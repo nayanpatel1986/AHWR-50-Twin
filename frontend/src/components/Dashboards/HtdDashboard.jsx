@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Grid, Paper, Typography, Box, Divider } from '@mui/material';
-import io from 'socket.io-client';
+import { socket } from '../../socket';
 import AnalogGauge from '../Common/AnalogGauge';
-
-const socket = io('/');
+import GaugeCard from '../Common/GaugeCard';
 
 const StatusIndicator = ({ label, value, mapping }) => {
     const active = mapping[value] || { text: 'Unknown', color: '#64748b' };
@@ -27,10 +26,11 @@ export default function HtdDashboard() {
     const [data, setData] = useState({});
 
     useEffect(() => {
-        socket.on('rig_data', (newData) => {
+        const handler = (newData) => {
             if (newData.htd) setData(newData.htd);
-        });
-        return () => socket.off('rig_data');
+        };
+        socket.on('rig_data', handler);
+        return () => socket.off('rig_data', handler);
     }, []);
 
     const statusMapping = {
@@ -150,41 +150,42 @@ export default function HtdDashboard() {
                 </Grid>
 
                 <Grid item xs={12} md={4}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <GaugeCard footer={<Typography variant="caption" sx={{ color: '#64748b', mt: 1 }}>REQ: {data.rpm_request || 0} | CMD: {data.rpm_command || 0}</Typography>}>
                         <AnalogGauge
                             value={data.rpm || 0}
                             max={250}
                             label="TOP DRIVE RPM"
                             unit="RPM"
+                            size="fill"
                             color="#38bdf8"
                         />
-                        <Typography variant="caption" sx={{ color: '#64748b', mt: 1 }}>REQ: {data.rpm_request || 0} | CMD: {data.rpm_command || 0}</Typography>
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} md={4}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <GaugeCard footer={<Typography variant="caption" sx={{ color: '#64748b', mt: 1 }}>REQ: {data.torque_request || 0} | CMD: {data.torque_command || 0}</Typography>}>
                         <AnalogGauge
                             value={data.torque || 0}
                             max={5000}
                             label="HTD TORQUE"
                             unit="daN*m"
+                            size="fill"
                             color="#fbbf24"
                         />
-                        <Typography variant="caption" sx={{ color: '#64748b', mt: 1 }}>REQ: {data.torque_request || 0} | CMD: {data.torque_command || 0}</Typography>
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} md={4}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <GaugeCard>
                         <AnalogGauge
                             value={data.inclination || 0}
                             max={100}
                             label="INCLINATION"
                             unit="%"
+                            size="fill"
                             color="#a78bfa"
                         />
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 {/* MECHANISMS & LINKS */}

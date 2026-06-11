@@ -1,0 +1,11 @@
+{
+  "name": "romii-mock",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Synthetic rig telemetry generator for local demos (no PLC required)",
+  "main": "mock-data.js",
+  "scripts": { "start": "node mock-data.js" },
+  "dependencies": {
+    "@influxdata/influxdb-client": "^1.33.2"
+  }
+}

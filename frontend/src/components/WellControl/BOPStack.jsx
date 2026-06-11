@@ -1,5 +1,5 @@
 import React from 'react';
-import { Box, Typography, Paper, Grid } from '@mui/material';
+import { Box, Typography, Paper } from '@mui/material';
 
 const RamIndicator = ({ label, active }) => (
     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
@@ -18,13 +18,19 @@ const RamIndicator = ({ label, active }) => (
     </Box>
 );
 
-const BOPStack = ({ rams }) => {
-    // Default safe state if props not provided
-    const status = {
+const BOPStack = ({ rams, live = true, accumulatorPressure }) => {
+    // When the feed is not live, do NOT render ram positions (false would look like a
+    // confirmed-open safe state). Force everything to an "unknown" (inactive) display.
+    const status = live ? {
         annular: rams?.annular || { open: false, close: false },
         pipe: rams?.pipe || { open: false, close: false },
         blind: rams?.blind || { open: false, close: false },
         shear: rams?.shear || false
+    } : {
+        annular: { open: false, close: false },
+        pipe: { open: false, close: false },
+        blind: { open: false, close: false },
+        shear: false
     };
 
     const RamPopup = ({ text, color, top }) => (
@@ -48,10 +54,34 @@ const BOPStack = ({ rams }) => {
     );
 
     return (
-        <Paper sx={{ p: 3, bgcolor: '#0f172a', color: 'white', display: 'flex', gap: 4, alignItems: 'center', justifyContent: 'center' }}>
+        <Paper
+            sx={{
+                p: { xs: 2, md: 3 },
+                bgcolor: '#0f172a',
+                color: 'white',
+                minHeight: { xs: 520, md: '100%' },
+                height: '100%',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: { xs: 2, md: 3 },
+                alignItems: 'center',
+                justifyContent: 'center',
+                border: '1px solid #1e293b',
+                overflow: 'hidden'
+            }}
+        >
 
             {/* --- BOP STACK SVG --- */}
-            <Box sx={{ position: 'relative', width: 200, height: 500 }}>
+            <Box
+                sx={{
+                    position: 'relative',
+                    flex: '0 0 auto',
+                    width: { xs: 'min(58vw, 260px)', md: 220, xl: 260 },
+                    maxWidth: '100%',
+                    minWidth: 160,
+                    aspectRatio: '2 / 5'
+                }}
+            >
                 <svg width="100%" height="100%" viewBox="0 0 200 500">
                     <defs>
                         <linearGradient id="bop-metal" x1="0%" y1="0%" x2="100%" y2="0%">
@@ -124,10 +154,16 @@ const BOPStack = ({ rams }) => {
             </Box>
 
             {/* --- DIGITAL INDICATORS --- */}
-            <Box>
+            <Box sx={{ width: '100%', maxWidth: 320, minWidth: 0 }}>
                 <Typography variant="h6" sx={{ color: '#94a3b8', mb: 3, borderBottom: '1px solid #334155', pb: 1 }}>
                     RAM STATUS
                 </Typography>
+
+                {!live && (
+                    <Typography variant="caption" sx={{ color: '#ef4444', fontWeight: 'bold', display: 'block', mb: 1 }}>
+                        ● NO LIVE DATA — RAM POSITIONS UNKNOWN
+                    </Typography>
+                )}
 
                 <RamIndicator label="ANNULAR PREVENTER" active={status.annular.close} />
                 <RamIndicator label="PIPE RAMS" active={status.pipe.close} />
@@ -135,8 +171,16 @@ const BOPStack = ({ rams }) => {
                 <RamIndicator label="SHEAR RAMS" active={status.shear} />
 
                 <Box sx={{ mt: 4, p: 2, bgcolor: '#1e293b', borderRadius: 1, border: '1px solid #334155' }}>
-                    <Typography variant="caption" sx={{ color: '#64748b', display: 'block', mb: 1 }}>SYSTEM PRESSURE</Typography>
-                    <Typography variant="h4" sx={{ color: '#38bdf8', fontWeight: 'bold' }}>3000 <span style={{ fontSize: 14 }}>psi</span></Typography>
+                    <Typography variant="caption" sx={{ color: '#64748b', display: 'block', mb: 1 }}>SYSTEM PRESSURE (ACCUMULATOR)</Typography>
+                    {live && Number.isFinite(Number(accumulatorPressure)) ? (
+                        <Typography variant="h4" sx={{ color: '#38bdf8', fontWeight: 'bold' }}>
+                            {Math.round(Number(accumulatorPressure))} <span style={{ fontSize: 14 }}>psi</span>
+                        </Typography>
+                    ) : (
+                        <Typography variant="h4" sx={{ color: '#64748b', fontWeight: 'bold' }}>
+                            — <span style={{ fontSize: 14 }}>NO DATA</span>
+                        </Typography>
+                    )}
                 </Box>
             </Box>
 

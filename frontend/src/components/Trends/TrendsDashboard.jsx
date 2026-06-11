@@ -1,13 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { Box, Typography, Paper, Grid, Checkbox, FormControlLabel, FormGroup, Accordion, AccordionSummary, AccordionDetails, Button, ClickAwayListener } from '@mui/material';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
-import * as XLSX from 'xlsx';
-import { saveAs } from 'file-saver';
 import { ChevronDown, RefreshCw, Download, Clock } from 'lucide-react';
-import io from 'socket.io-client';
+import { socket } from '../../socket';
 import axios from 'axios';
-
-const socket = io('/');
 
 const AVAILABLE_METRICS = {
     drilling: ['hook_load', 'wob', 'bit_depth', 'hole_depth', 'rop', 'rpm', 'torque', 'delta_torque'],
@@ -188,35 +184,25 @@ export default function TrendsDashboard() {
             return;
         }
 
-        // 1. Format Data for Excel
-        const exportData = data.map(row => {
-            const formattedRow = {
-                Timestamp: new Date(row.timestamp).toLocaleString(),
-            };
-            selectedMetrics.forEach(metric => {
-                if (row[metric] !== undefined) {
-                    formattedRow[metric] = row[metric];
-                }
-            });
-            return formattedRow;
-        });
-
-        // 2. Create Workbook
-        const worksheet = XLSX.utils.json_to_sheet(exportData);
-        const workbook = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(workbook, worksheet, "Trends Data");
-
-        // 3. Keep column widths reasonable
-        const wscols = [{ wch: 25 }]; // Timestamp column width
-        selectedMetrics.forEach(() => wscols.push({ wch: 15 }));
-        worksheet['!cols'] = wscols;
-
-        // 4. Write and Download
-        const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
-        const dataBlob = new Blob([excelBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;charset=UTF-8' });
-
-        const fileName = `ROMII_Trends_${new Date().toISOString().replace(/[:.]/g, '-')}.xlsx`;
-        saveAs(dataBlob, fileName);
+        const columns = ['Timestamp', ...selectedMetrics];
+        const escapeCsv = (value) => {
+            const text = value == null ? '' : String(value);
+            return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+        };
+        const rows = data.map((row) => [
+            new Date(row.timestamp).toLocaleString(),
+            ...selectedMetrics.map((metric) => row[metric] ?? '')
+        ]);
+        const csv = [columns, ...rows].map((row) => row.map(escapeCsv).join(',')).join('\n');
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `ROMII_Trends_${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
     };
 
     return (
@@ -331,7 +317,7 @@ export default function TrendsDashboard() {
                     ))}
 
                     <Button variant="outlined" startIcon={<Download />} onClick={handleExport} sx={{ color: '#fbbf24', borderColor: '#fbbf24', ml: 2, '&:hover': { bgcolor: 'rgba(251, 191, 36, 0.1)' } }}>
-                        Export Excel
+                        Export CSV
                     </Button>
 
                     <Button variant="outlined" startIcon={<RefreshCw />} onClick={fetchHistory} sx={{ color: '#38bdf8', borderColor: '#334155', ml: 1 }}>

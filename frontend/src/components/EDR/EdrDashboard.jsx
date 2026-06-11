@@ -1,14 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { Box, Typography, Paper, Grid, MenuItem, Select, FormControl, Button, FormGroup, ListSubheader } from '@mui/material';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
-import io from 'socket.io-client';
+import { socket } from '../../socket';
 import axios from 'axios';
 import { Clock } from 'lucide-react';
 
-const socket = io('/');
-
 const AVAILABLE_METRICS = {
     drilling: ['hook_load', 'wob', 'bit_depth', 'hole_depth', 'rop', 'rpm', 'torque', 'delta_torque'],
+    drawworks: ['hook_load', 'block_position'],
     mudpump: ['spm', 'pressure', 'total_spm', 'flow_in', 'flow_out_percentage'],
     fluid: ['total_tank_volume', 'tank_gain_loss', 'trip_tank'],
     cat_engine: ['rpm', 'load', 'coolant_temp', 'fuel_pressure', 'oil_pressure', 'battery_voltage', 'fuel_rate'],
@@ -30,7 +29,7 @@ const ALL_METRICS = Object.entries(AVAILABLE_METRICS).flatMap(([category, fields
 const DEFAULT_TRACKS = [
     {
         left: { metric: 'cat_engine.rpm', min: 0, max: 2000 },
-        right: { metric: 'drilling.hook_load', min: 0, max: 500 }
+        right: { metric: 'drawworks.hook_load', min: 0, max: 500 }
     },
     {
         left: { metric: 'mudpump.pressure', min: 0, max: 500 },
@@ -93,9 +92,8 @@ export default function EdrDashboard() {
             fetchHistory();
 
             // Also fetch the single latest point for immediate readout update
-            fetch('/api/rig/latest')
-                .then(res => res.json())
-                .then(latestPoint => {
+            axios.get('/api/rig/latest')
+                .then(({ data: latestPoint }) => {
                     if (latestPoint && Object.keys(latestPoint).length > 0) {
                         processLivePoint(latestPoint);
                     }

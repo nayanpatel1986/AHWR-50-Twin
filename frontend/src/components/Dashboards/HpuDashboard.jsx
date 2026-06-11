@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Grid, Paper, Typography, Box, Divider } from '@mui/material';
-import io from 'socket.io-client';
+import { socket } from '../../socket';
 import AnalogGauge from '../Common/AnalogGauge';
-
-const socket = io('/');
+import GaugeCard from '../Common/GaugeCard';
 
 const StatusIndicator = ({ label, value, mapping }) => {
     const active = mapping[value] || { text: 'Unknown', color: '#64748b' };
@@ -27,10 +26,11 @@ export default function HpuDashboard() {
     const [data, setData] = useState({});
 
     useEffect(() => {
-        socket.on('rig_data', (newData) => {
+        const handler = (newData) => {
             if (newData.hpu) setData(newData.hpu);
-        });
-        return () => socket.off('rig_data');
+        };
+        socket.on('rig_data', handler);
+        return () => socket.off('rig_data', handler);
     }, []);
 
     const statusMapping = {
@@ -78,51 +78,55 @@ export default function HpuDashboard() {
                 </Grid>
 
                 <Grid item xs={12} md={3}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <GaugeCard>
                         <AnalogGauge
                             value={data.discharge_pressure || 0}
                             max={350}
                             label="DISCHARGE PRESS"
                             unit="bar"
+                            size="fill"
                             color="#38bdf8"
                         />
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} md={3}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <GaugeCard>
                         <AnalogGauge
                             value={data.aux_pressure || 0}
                             max={250}
                             label="AUX PRESSURE"
                             unit="bar"
+                            size="fill"
                             color="#a78bfa"
                         />
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} md={3}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <GaugeCard>
                         <AnalogGauge
                             value={data.oil_temp || 0}
                             max={100}
                             label="OIL TEMP"
                             unit="°C"
+                            size="fill"
                             color="#f97316"
                         />
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} md={3}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                    <GaugeCard>
                         <AnalogGauge
                             value={data.oil_level || 0}
                             max={100}
                             label="OIL LEVEL"
                             unit="%"
+                            size="fill"
                             color="#22d3ee"
                         />
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} md={4}>

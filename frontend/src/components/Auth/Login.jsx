@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Box, Paper, TextField, Button, Typography, Alert, Container } from '@mui/material';
 import { User, Lock, Activity } from 'lucide-react';
@@ -11,6 +11,11 @@ const Login = () => {
     const [loading, setLoading] = useState(false);
     const navigate = useNavigate();
     const { login } = useAuth();
+    const [authInfo, setAuthInfo] = useState(null);
+
+    useEffect(() => {
+        axios.get('/api/auth/info').then((r) => setAuthInfo(r.data)).catch(() => {});
+    }, []);
 
     const handleChange = (e) => {
         setCredentials({ ...credentials, [e.target.name]: e.target.value });
@@ -27,7 +32,7 @@ const Login = () => {
             const res = await axios.post(`${API_URL}/api/login`, credentials);
 
             if (res.data.success) {
-                login(res.data.user);
+                login(res.data.user, res.data.token);
                 navigate('/');
             }
         } catch (err) {
@@ -71,6 +76,12 @@ const Login = () => {
                         <Typography variant="subtitle2" sx={{ color: '#94a3b8' }}>
                             Digital Twin Access
                         </Typography>
+                        {authInfo?.ldapEnabled && (
+                            <Typography variant="caption" sx={{ color: '#64748b', mt: 0.5, textAlign: 'center' }}>
+                                Windows domain sign-in enabled — use{' '}
+                                {authInfo.domain ? `${authInfo.domain}\\username` : 'DOMAIN\\username'}
+                            </Typography>
+                        )}
                     </Box>
 
                     {error && (

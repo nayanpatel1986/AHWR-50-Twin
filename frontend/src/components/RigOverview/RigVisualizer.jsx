@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Box, Typography, Paper, Tooltip } from '@mui/material';
 import { Move } from 'lucide-react';
 
-const RigVisualizer = ({ crownsaverOn, floorsaverOn, travellingUp, travellingDown, height = 500 }) => {
+const RigVisualizer = ({ crownsaverOn, floorsaverOn, travellingUp, travellingDown, height = { xs: 520, md: 'clamp(500px, 52vh, 620px)' } }) => {
     const containerRef = useRef(null);
 
     // We completely abandon React state for this value to avoid React 18 re-render desyncs 
@@ -59,10 +59,11 @@ const RigVisualizer = ({ crownsaverOn, floorsaverOn, travellingUp, travellingDow
     return (
         <Paper
             sx={{
-                p: 2,
+                p: { xs: 1.5, md: 2 },
                 bgcolor: '#0f172a',
                 color: 'white',
                 height: height,
+                minHeight: { xs: 520, md: 500 },
                 display: 'flex',
                 flexDirection: 'column',
                 alignItems: 'center',
@@ -74,7 +75,17 @@ const RigVisualizer = ({ crownsaverOn, floorsaverOn, travellingUp, travellingDow
             }}
             ref={containerRef}
         >
-            <Box sx={{ position: 'relative', width: 220, height: 440 }}>
+            <Box
+                sx={{
+                    position: 'relative',
+                    width: 'min(100%, 340px)',
+                    maxWidth: '100%',
+                    flex: '1 1 auto',
+                    minHeight: 0,
+                    aspectRatio: '1 / 2',
+                    maxHeight: 'calc(100% - 58px)'
+                }}
+            >
                 {/* SVG Schematic Layer */}
                 <svg width="100%" height="100%" viewBox="0 0 220 440" style={{ filter: 'drop-shadow(0 0 5px rgba(0,0,0,0.5))' }}>
                     <defs>
@@ -133,14 +144,14 @@ const RigVisualizer = ({ crownsaverOn, floorsaverOn, travellingUp, travellingDow
                         left: '50%',
                         bottom: `${5 + (posRef.current * 0.85)}%`,
                         transform: 'translateX(-50%)',
-                        width: 40,
-                        height: 60,
+                        width: '18.2%',
+                        height: '13.6%',
                         zIndex: 2,
                         transition: 'bottom 0.2s linear'
                     }}
                 >
                     {/* Block Icon */}
-                    <svg width="40" height="60" viewBox="0 0 40 60">
+                    <svg width="100%" height="100%" viewBox="0 0 40 60">
                         {/* Cables extending up */}
                         <line x1="10" y1="0" x2="10" y2="-400" stroke="#94a3b8" strokeWidth="1" />
                         <line x1="30" y1="0" x2="30" y2="-400" stroke="#94a3b8" strokeWidth="1" />

@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Grid, Paper, Typography, Box, Divider } from '@mui/material';
-import io from 'socket.io-client';
+import { socket } from '../../socket';
 import AnalogGauge from '../Common/AnalogGauge';
-
-const socket = io('/');
+import GaugeCard from '../Common/GaugeCard';
 
 const StatusIndicator = ({ label, value, mapping }) => {
     const active = mapping[value] || { text: 'Unknown', color: '#64748b' };
@@ -27,10 +26,11 @@ export default function CatEngineDashboard() {
     const [data, setData] = useState({});
 
     useEffect(() => {
-        socket.on('rig_data', (newData) => {
+        const handler = (newData) => {
             if (newData.cat_engine) setData(newData.cat_engine);
-        });
-        return () => socket.off('rig_data');
+        };
+        socket.on('rig_data', handler);
+        return () => socket.off('rig_data', handler);
     }, []);
 
     const statusMapping = {
@@ -72,53 +72,55 @@ export default function CatEngineDashboard() {
                 </Grid>
 
                 <Grid item xs={12} sm={6} md={3}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', justifyContent: 'center' }}>
+                    <GaugeCard footer={<Typography variant="caption" sx={{ color: '#64748b', mt: 1 }}>RUN: {data.run_hours || 0} HRS</Typography>}>
                         <AnalogGauge
                             value={data.rpm || 0}
                             max={2100}
                             label="ENGINE SPEED"
                             unit="RPM"
+                            size="fill"
                             color="#38bdf8"
                         />
-                        <Typography variant="caption" sx={{ color: '#64748b', mt: 1 }}>RUN: {data.run_hours || 0} HRS</Typography>
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} sm={6} md={3}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', justifyContent: 'center' }}>
+                    <GaugeCard footer={<Typography variant="caption" sx={{ color: '#64748b', mt: 1 }}>FUEL RATE: {data.fuel_rate || 0} L/H</Typography>}>
                         <AnalogGauge
                             value={data.load || 0}
                             max={100}
                             label="ENGINE LOAD"
                             unit="%"
+                            size="fill"
                             color={data.load > 85 ? '#ef4444' : '#4ade80'}
                         />
-                        <Typography variant="caption" sx={{ color: '#64748b', mt: 1 }}>FUEL RATE: {data.fuel_rate || 0} L/H</Typography>
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} sm={6} md={3}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', justifyContent: 'center' }}>
+                    <GaugeCard>
                         <AnalogGauge
                             value={data.oil_pressure || 0}
                             max={10}
                             label="OIL PRESSURE"
                             unit="bar"
+                            size="fill"
                             color="#fbbf24"
                         />
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} sm={6} md={3}>
-                    <Paper sx={{ p: 3, bgcolor: '#1e293b', display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', justifyContent: 'center' }}>
+                    <GaugeCard>
                         <AnalogGauge
                             value={data.pedal_position || 0}
                             max={100}
                             label="ACCEL PEDAL"
                             unit="%"
+                            size="fill"
                             color="#a855f7"
                         />
-                    </Paper>
+                    </GaugeCard>
                 </Grid>
 
                 <Grid item xs={12} md={3}>

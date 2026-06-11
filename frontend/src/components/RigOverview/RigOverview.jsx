@@ -1,25 +1,18 @@
 import React, { useState, useEffect } from 'react';
-import { Grid, Paper, Typography, Box, IconButton, Dialog, DialogTitle, DialogContent, DialogActions, TextField, Button, MenuItem, Select, InputLabel, FormControl, Divider, Slider, Switch, FormControlLabel, Checkbox } from '@mui/material';
-import io from 'socket.io-client';
+import { Grid, Paper, Typography, Box, IconButton, Dialog, DialogTitle, DialogContent, DialogActions, TextField, Button, MenuItem, Select, InputLabel, FormControl } from '@mui/material';
+import { socket } from '../../socket';
 import AnalogGauge from '../Common/AnalogGauge';
 import RigVisualizer from './RigVisualizer';
+import axios from '../../api';
+import { useAuth } from '../../context/AuthContext';
 import {
-    Activity,
     Settings,
     Edit2,
-    Database,
-    Upload,
-    Download,
-    RefreshCw,
     Plus,
     Trash2,
     Check,
-    X,
-    ArrowDownToLine,
-    Move
+    X
 } from 'lucide-react';
-
-const socket = io('/');
 
 // Default Config with Layout Props
 const DEFAULT_DASHBOARD_GAUGES = [
@@ -77,6 +70,10 @@ const DEFAULT_BOTTOM_STATS = [
 ];
 
 export default function RigOverview() {
+    const { user } = useAuth();
+    const canEditLayout = user?.role === 'admin';
+    const canCalibrate = user?.role === 'admin' || user?.role === 'operator';
+
     // --- State ---
     const [rigData, setRigData] = useState({
         hook_load: 0, pump_pressure: 0, torque: 0,
@@ -220,13 +217,15 @@ export default function RigOverview() {
 
     const [tempStatKey, setTempStatKey] = useState('');
 
+    // Live-data freshness / connection state (so a dead feed looks different from an idle rig).
+    const [feedState, setFeedState] = useState({ connected: socket.connected, stale: false, hasData: false });
+
     // --- Effects ---
     useEffect(() => {
-        console.log("Fetching dashboard layout and latest data...");
+        if (import.meta.env.DEV) console.log("Fetching dashboard layout and latest data...");
         // Load Global Layout from Backend
-        fetch(`/api/dashboard/layout?t=${Date.now()}`)
-            .then(res => res.json())
-            .then(config => {
+        axios.get(`/api/dashboard/layout?t=${Date.now()}`)
+            .then(({ data: config }) => {
                 if (config.gauges) setGauges(config.gauges);
                 if (config.units) setUnits(config.units);
                 if (config.bottomStats) setBottomStats(config.bottomStats);
@@ -234,9 +233,8 @@ export default function RigOverview() {
             .catch(err => console.error("Failed to load dashboard layout:", err));
 
         // Fetch Latest Data for immediate display
-        fetch('/api/rig/latest')
-            .then(res => res.json())
-            .then(newData => {
+        axios.get('/api/rig/latest')
+            .then(({ data: newData }) => {
                 if (newData && Object.keys(newData).length > 0) {
                     processRigData(newData);
                 }
@@ -326,14 +324,23 @@ export default function RigOverview() {
 
     useEffect(() => {
         // Real-time Layout Updates
-        socket.on('dashboard_layout_update', (config) => {
-            console.log("Received real-time layout update:", config);
+        const handleLayoutUpdate = (config) => {
+            if (import.meta.env.DEV) console.log("Received real-time layout update:", config);
             if (config.gauges) setGauges(config.gauges);
             if (config.units) setUnits(config.units);
             if (config.bottomStats) setBottomStats(config.bottomStats);
-        });
+        };
+        socket.on('dashboard_layout_update', handleLayoutUpdate);
 
-        socket.on('rig_data', (newData) => {
+        const handleRigData = (newData) => {
+            // Track feed freshness from server metadata (when present).
+            const meta = newData && newData._meta;
+            setFeedState(prev => ({
+                connected: socket.connected,
+                stale: meta ? !!meta.stale : prev.stale,
+                hasData: true
+            }));
+
             // If we receive an empty object or null, force release to zero
             if (!newData || Object.keys(newData).length === 0) {
                 setRigData(prev => ({
@@ -346,16 +353,24 @@ export default function RigOverview() {
                     pct_sequence: 0, spinner_floating: 0,
                     spinner_makeup_torque: 0,
                     cwk_clamp_status: 0, cwk_clamp_pressure: 0,
-                    // Preserve stateful depths if needed, or zero them if requested? 
-                    // User said "data should be zero", imply sensors. Depth is state.
-                    // Let's keep depth from backend (which physics engine maintains) or 0 if backend killed.
-                    // But if backend sends {}, we zero sensors.
                 }));
                 return;
             }
             processRigData(newData);
-        });
-        return () => socket.off('rig_data');
+        };
+        socket.on('rig_data', handleRigData);
+
+        const handleConnect = () => setFeedState(prev => ({ ...prev, connected: true }));
+        const handleDisconnect = () => setFeedState(prev => ({ ...prev, connected: false }));
+        socket.on('connect', handleConnect);
+        socket.on('disconnect', handleDisconnect);
+
+        return () => {
+            socket.off('dashboard_layout_update', handleLayoutUpdate);
+            socket.off('rig_data', handleRigData);
+            socket.off('connect', handleConnect);
+            socket.off('disconnect', handleDisconnect);
+        };
     }, []);
 
     // --- Helpers ---
@@ -365,11 +380,8 @@ export default function RigOverview() {
             bottomStats: newBottomStats || bottomStats,
             units
         };
-        fetch('/api/dashboard/layout', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        }).catch(e => console.error("Failed to save layout", e));
+        axios.post('/api/dashboard/layout', payload)
+            .catch(e => console.error("Failed to save layout", e));
     };
 
     const saveGauges = (newGauges) => {
@@ -384,11 +396,10 @@ export default function RigOverview() {
 
     const saveUnits = (newUnits) => {
         setUnits(newUnits);
-        fetch('/api/dashboard/layout', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ gauges, bottomStats, units: newUnits })
-        }).catch(e => console.error("Failed to save layout", e));
+        if (canEditLayout) {
+            axios.post('/api/dashboard/layout', { gauges, bottomStats, units: newUnits })
+                .catch(e => console.error("Failed to save layout", e));
+        }
     };
 
     const formatWOB = (val) => {
@@ -445,12 +456,9 @@ export default function RigOverview() {
 
     // --- Drilling API Calls ---
     const handleZeroWOB = async () => {
+        if (!canCalibrate) return;
         try {
-            await fetch('/api/drilling/zero-wob', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ currentHookLoad: rigData.hook_load })
-            });
+            await axios.post('/api/drilling/zero-wob', { currentHookLoad: rigData.hook_load });
             // Optional alert or toast
         } catch (e) {
             console.error(e);
@@ -459,6 +467,7 @@ export default function RigOverview() {
     };
 
     const handleSetDepth = async () => {
+        if (!canCalibrate) return;
         try {
             // Convert to FT for backend if needed
             let bitDepth = calibrationValues.bitDepth ? Number(calibrationValues.bitDepth) : undefined;
@@ -470,11 +479,7 @@ export default function RigOverview() {
                 if (holeDepth !== undefined) holeDepth = holeDepth * 0.3048;
             }
 
-            await fetch('/api/drilling/set-depth', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ bitDepth, holeDepth })
-            });
+            await axios.post('/api/drilling/set-depth', { bitDepth, holeDepth });
             setIsDrillingControlsOpen(false);
         } catch (e) {
             console.error(e);
@@ -537,10 +542,54 @@ export default function RigOverview() {
 
     // --- Digital Inputs are now directly parsed from Rig Data ---
 
+    const feedAlert = !feedState.connected
+        ? { text: 'NO LIVE DATA - TELEMETRY DISCONNECTED', color: '#ef4444' }
+        : (feedState.stale
+            ? { text: 'STALE DATA - FEED NOT UPDATING (values may not be live)', color: '#fbbf24' }
+            : (!feedState.hasData
+                ? { text: 'WAITING FOR LIVE DATA...', color: '#fbbf24' }
+                : null));
+
+    const statusCellSx = {
+        minWidth: 0,
+        minHeight: { xs: 78, sm: 74 },
+        p: { xs: 1, sm: 1.25 },
+        textAlign: 'center',
+        display: 'flex',
+        flexDirection: 'column',
+        justifyContent: 'space-between',
+        gap: 0.75,
+        border: '1px solid #334155',
+        borderRadius: 1,
+        bgcolor: 'rgba(15, 23, 42, 0.25)'
+    };
+
+    const statusValueSx = {
+        fontWeight: 'bold',
+        mt: 0.5,
+        lineHeight: 1.1,
+        fontSize: { xs: '1rem', sm: '1.35rem', md: '1.5rem' },
+        overflowWrap: 'anywhere'
+    };
+
     return (
-        <Box sx={{ position: 'relative' }}>
+        <Box sx={{ position: 'relative', maxWidth: '100%', overflowX: 'hidden' }}>
+            {feedAlert && (
+                <Box sx={{
+                    mb: 2, px: 2, py: 1, borderRadius: 1,
+                    bgcolor: `${feedAlert.color}1a`,
+                    border: `1px solid ${feedAlert.color}`,
+                    display: 'flex', alignItems: 'center', gap: 1
+                }}>
+                    <Box sx={{ width: 10, height: 10, borderRadius: '50%', bgcolor: feedAlert.color, boxShadow: `0 0 8px ${feedAlert.color}` }} />
+                    <Typography variant="body2" sx={{ color: feedAlert.color, fontWeight: 'bold', letterSpacing: 0.5 }}>
+                        {feedAlert.text}
+                    </Typography>
+                </Box>
+            )}
             {/* Absolute positioned controls to reclaim vertical space */}
-            <Box sx={{ position: 'absolute', top: -16, right: 0, zIndex: 10, display: 'flex', gap: 1 }}>
+            {canEditLayout && (
+            <Box sx={{ position: { xs: 'static', sm: 'absolute' }, top: -16, right: 0, zIndex: 10, display: 'flex', justifyContent: 'flex-end', gap: 1, mb: { xs: 1, sm: 0 } }}>
                 {editMode && gauges.length < 5 && (
                     <Button
                         variant="contained"
@@ -567,6 +616,7 @@ export default function RigOverview() {
                     )}
                 </Box>
             </Box>
+            )}
 
             <Grid container spacing={3} sx={{ alignItems: 'stretch' }}>
                 {/* Left Side: Rig Visualizer */}
@@ -576,58 +626,55 @@ export default function RigOverview() {
                         floorsaverOn={rigData.floorsaverOn}
                         travellingUp={rigData.travelling_up}
                         travellingDown={rigData.travelling_down}
-                        height={500}
                     />
                 </Grid>
 
                 {/* Right Side: Drilling Status Panel & Gauges */}
                 <Grid item xs={12} md={9} sx={{ display: 'flex', flexDirection: 'column' }}>
                     {/* --- Drilling Status Panel (Dedicated Stat Panel) --- */}
-                    <Paper sx={{ p: 1.5, mb: 3, bgcolor: '#1e293b', color: 'white', display: 'flex', justifyContent: 'space-around', alignItems: 'center', border: '1px solid #334155', height: '86px' }}>
+                    <Paper sx={{ p: 1.25, mb: 2, bgcolor: '#1e293b', color: 'white', display: 'grid', gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))' }, gap: 1, alignItems: 'stretch', border: '1px solid #334155', height: 'auto' }}>
                         {/* Rig Activity Indicator */}
-                        <Box sx={{ textAlign: 'center', minWidth: 150, display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'space-between' }}>
+                        <Box sx={statusCellSx}>
                             <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 1, color: '#94a3b8' }}>
                                 <Typography variant="caption" sx={{ letterSpacing: 1, fontWeight: 'bold' }}>OP.MODE</Typography>
                             </Box>
                             <Box sx={{ mt: 'auto' }}>
-                                <Typography variant="h5" sx={{ fontWeight: 'bold', color: rigData.operation_mode === 1 ? '#4ade80' : '#38bdf8', mt: 0.5 }}>
+                                <Typography variant="h5" sx={{ ...statusValueSx, color: rigData.operation_mode === 1 ? '#4ade80' : '#38bdf8' }}>
                                     {getOpModeLabel(rigData.operation_mode)}
                                 </Typography>
                             </Box>
                         </Box>
 
-                        <Divider orientation="vertical" flexItem sx={{ bgcolor: '#334155' }} />
-
                         {/* ACS Status Indicator */}
-                        <Box sx={{ textAlign: 'center', minWidth: 150, display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'space-between' }}>
+                        <Box sx={statusCellSx}>
                             <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 1, color: '#94a3b8' }}>
                                 <Typography variant="caption" sx={{ letterSpacing: 1, fontWeight: 'bold' }}>ACS</Typography>
                             </Box>
                             <Box sx={{ mt: 'auto' }}>
-                                <Typography variant="h5" sx={{ fontWeight: 'bold', color: rigData.acs_status === 1 ? '#4ade80' : (rigData.acs_status === 2 ? '#ef4444' : '#94a3b8'), mt: 0.5 }}>
+                                <Typography variant="h5" sx={{ ...statusValueSx, color: rigData.acs_status === 1 ? '#4ade80' : (rigData.acs_status === 2 ? '#ef4444' : '#94a3b8') }}>
                                     {getAcsStatusLabel(rigData.acs_status)}
                                 </Typography>
                             </Box>
                         </Box>
 
-                        <Divider orientation="vertical" flexItem sx={{ bgcolor: '#334155' }} />
-
                         {/* Hole Depth Stat */}
-                        <Box sx={{ textAlign: 'center', minWidth: 150, display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'space-between' }}>
+                        <Box sx={statusCellSx}>
                             <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 1, color: '#94a3b8' }}>
                                 <Typography variant="caption" sx={{ letterSpacing: 1, fontWeight: 'bold' }}>TOTAL BIT DEPTH</Typography>
-                                <IconButton
-                                    size="small" sx={{ color: '#64748b', p: 0.5, '&:hover': { color: '#4ade80' } }}
-                                    onClick={() => {
-                                        setCalibrationValues({ ...calibrationValues, holeDepth: formatDepth(rigData.hole_depth), mode: 'depth' });
-                                        setIsDrillingControlsOpen(true);
-                                    }}
-                                >
-                                    <Edit2 size={12} />
-                                </IconButton>
+                                {canCalibrate && (
+                                    <IconButton
+                                        size="small" sx={{ color: '#64748b', p: 0.5, '&:hover': { color: '#4ade80' } }}
+                                        onClick={() => {
+                                            setCalibrationValues({ ...calibrationValues, holeDepth: formatDepth(rigData.hole_depth), mode: 'depth' });
+                                            setIsDrillingControlsOpen(true);
+                                        }}
+                                    >
+                                        <Edit2 size={12} />
+                                    </IconButton>
+                                )}
                             </Box>
                             <Box sx={{ mt: 'auto' }}>
-                                <Typography variant="h5" sx={{ fontWeight: 'bold', color: '#4ade80', mt: 0.5 }}>
+                                <Typography variant="h5" sx={{ ...statusValueSx, color: '#4ade80' }}>
                                     {formatDepth(rigData.hole_depth)}
                                     <Button
                                         variant="text" size="small"
@@ -643,24 +690,24 @@ export default function RigOverview() {
                             </Box>
                         </Box>
 
-                        <Divider orientation="vertical" flexItem sx={{ bgcolor: '#334155' }} />
-
                         {/* Bit Position Stat */}
-                        <Box sx={{ textAlign: 'center', minWidth: 150, display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'space-between' }}>
+                        <Box sx={statusCellSx}>
                             <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 1, color: '#94a3b8' }}>
                                 <Typography variant="caption" sx={{ letterSpacing: 1, fontWeight: 'bold' }}>BIT DEPTH</Typography>
-                                <IconButton
-                                    size="small" sx={{ color: '#64748b', p: 0.5, '&:hover': { color: '#38bdf8' } }}
-                                    onClick={() => {
-                                        setCalibrationValues({ ...calibrationValues, bitDepth: formatDepth(rigData.bit_depth), mode: 'depth' });
-                                        setIsDrillingControlsOpen(true);
-                                    }}
-                                >
-                                    <Edit2 size={12} />
-                                </IconButton>
+                                {canCalibrate && (
+                                    <IconButton
+                                        size="small" sx={{ color: '#64748b', p: 0.5, '&:hover': { color: '#38bdf8' } }}
+                                        onClick={() => {
+                                            setCalibrationValues({ ...calibrationValues, bitDepth: formatDepth(rigData.bit_depth), mode: 'depth' });
+                                            setIsDrillingControlsOpen(true);
+                                        }}
+                                    >
+                                        <Edit2 size={12} />
+                                    </IconButton>
+                                )}
                             </Box>
                             <Box sx={{ mt: 'auto' }}>
-                                <Typography variant="h5" sx={{ fontWeight: 'bold', color: '#38bdf8', mt: 0.5 }}>
+                                <Typography variant="h5" sx={{ ...statusValueSx, color: '#38bdf8' }}>
                                     {formatDepth(rigData.bit_depth)}
                                     <Typography component="span" variant="caption" sx={{ ml: 0.5, color: '#64748b' }}>{units.depth}</Typography>
                                 </Typography>
@@ -669,12 +716,13 @@ export default function RigOverview() {
                     </Paper>
 
                     {/* Gauges Grid */}
-                    <Grid container spacing={2} sx={{ mb: 4, alignItems: 'center' }}>
+                    <Grid container spacing={2} sx={{ mb: 0, alignItems: 'stretch' }}>
                         {gauges.map((g, index) => (
                             <Grid
                                 item
                                 xs={12} sm={6} md={g.gridWidth || 3}
                                 key={g.id}
+                                sx={{ display: 'flex' }}
                             >
                                 {/* Wrapper DIV for Drag Events */}
                                 <div
@@ -689,7 +737,8 @@ export default function RigOverview() {
                                         transition: 'all 0.2s',
                                         border: editMode && dragOverIndex === index ? '2px dashed #fbbf24' : '2px solid transparent',
                                         borderRadius: 8,
-                                        height: '100%'
+                                        height: '100%',
+                                        width: '100%'
                                     }}
                                 >
                                     <Paper
@@ -706,6 +755,8 @@ export default function RigOverview() {
                                             position: 'relative',
                                             border: editMode ? '1px dashed #475569' : 'none',
                                             height: '100%',
+                                            width: '100%',
+                                            minHeight: { xs: 280, md: 280, xl: 320 },
                                             transition: 'all 0.2s',
                                             '&:hover': {
                                                 bgcolor: editMode ? '#1e293b' : 'transparent',
@@ -719,7 +770,9 @@ export default function RigOverview() {
                                             min={Number(g.min)}
                                             label={g.label}
                                             unit={g.unit}
-                                            size={g.size || 160}
+                                            size="fill"
+                                            minSize={150}
+                                            maxSize={Math.max(Number(g.size || 220), 320)}
                                             color={g.color}
                                             majorTicks={g.majorTicks || 5}
                                             minorTicks={g.minorTicks || 4}

@@ -2,10 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { Box, Typography, Paper, Grid, TextField, Button, Alert, LinearProgress } from '@mui/material';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, AreaChart, Area } from 'recharts';
 import { Anchor, Activity, AlertTriangle, Gauge, ArrowDown, ArrowUp, Settings, RotateCw, Droplets } from 'lucide-react';
-import io from 'socket.io-client';
+import { socket } from '../../socket';
 import AnalogGauge from '../Common/AnalogGauge';
-
-const socket = io('/');
 
 const FishingDashboard = () => {
     // 1. Critical Hoisting Parameters

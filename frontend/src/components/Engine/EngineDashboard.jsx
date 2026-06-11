@@ -1,10 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { Grid, Paper, Typography, Box } from '@mui/material';
 import { Gauge, Thermometer, Droplets, Battery, Activity } from 'lucide-react';
-import io from 'socket.io-client';
+import { socket } from '../../socket';
 import MaintenancePanel from './MaintenancePanel';
-
-const socket = io('/');
+import axios from '../../api';
 
 function MetricCard({ title, value, unit, icon: Icon, color = '#38bdf8' }) {
     return (
@@ -35,23 +34,23 @@ export default function EngineDashboard() {
 
     useEffect(() => {
         // Fetch latest data on mount
-        fetch('/api/rig/latest')
-            .then(res => res.json())
-            .then(data => {
-                if (data.engine) {
-                    setEngineData(data.engine);
+        axios.get('/api/rig/latest')
+            .then(({ data }) => {
+                if (data.cat_engine) {
+                    setEngineData(data.cat_engine);
                 }
             })
             .catch(err => console.error("Failed to fetch latest engine data:", err));
 
-        socket.on('rig_data', (data) => {
-            if (data.engine) {
-                setEngineData(data.engine);
+        const handler = (data) => {
+            if (data.cat_engine) {
+                setEngineData(data.cat_engine);
             }
-        });
+        };
+        socket.on('rig_data', handler);
 
         return () => {
-            socket.off('rig_data');
+            socket.off('rig_data', handler);
         };
     }, []);
 

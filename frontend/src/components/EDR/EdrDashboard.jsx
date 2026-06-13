@@ -264,9 +264,15 @@ export default function EdrDashboard() {
 
     const displayedStrips = useMemo(() => [depthLogStrip, ...edrConfig.strips], [depthLogStrip, edrConfig.strips]);
 
-    const configuredMetrics = useMemo(() => (
-        Array.from(new Set(displayedStrips.flatMap(strip => strip.pens.map(pen => pen.metric))))
-    ), [displayedStrips]);
+    const configuredMetrics = useMemo(() => {
+        const metrics = new Set(['drilling.bit_depth', 'drilling.hole_depth']);
+        edrConfig.strips.forEach(strip => {
+            strip.pens.forEach(pen => {
+                metrics.add(pen.metric);
+            });
+        });
+        return Array.from(metrics);
+    }, [edrConfig.strips]);
 
     const sortedTimestamps = useMemo(() => (
         data
@@ -340,10 +346,12 @@ export default function EdrDashboard() {
 
     const processLivePoint = useCallback((newData) => {
         setData(prev => {
-            const now = new Date();
+            const serverTsStr = newData?._meta?.ts;
+            const ptTime = serverTsStr ? new Date(serverTsStr) : new Date();
+            const timestamp = ptTime.getTime();
             const newPoint = {
-                name: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
-                timestamp: now.getTime()
+                name: ptTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
+                timestamp: timestamp
             };
 
             Object.keys(newData || {}).forEach(measurement => {
@@ -365,7 +373,7 @@ export default function EdrDashboard() {
                 if (!uniqueMap.has(key)) uniqueMap.set(key, item);
             });
 
-            const cutoff = now.getTime() - getRangeMs(timeRange);
+            const cutoff = timestamp - getRangeMs(timeRange);
             return Array.from(uniqueMap.values())
                 .sort((a, b) => a.timestamp - b.timestamp)
                 .filter(pt => (pt.timestamp || 0) >= cutoff);
@@ -893,7 +901,6 @@ export default function EdrDashboard() {
                                         type="number"
                                         scale="time"
                                         domain={isCustom && customRange.start && customRange.end ? [new Date(customRange.start).getTime(), new Date(customRange.end).getTime()] : ['dataMin', 'dataMax']}
-                                        reversed
                                         tickFormatter={(unixTime) => new Date(unixTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}
                                         stroke="#94a3b8"
                                         width={isDepthLog ? 80 : 0}
